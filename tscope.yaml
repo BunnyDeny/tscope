@@ -1,0 +1,41 @@
+# ===========================================================================
+# tscope 配置模板 —— 当前以 GD32F503RE + SEGGER J-Link 为例
+#
+# 路径规则：chip.description / chip.pack / firmware.elf 里的相对路径，
+# 一律相对「本配置文件所在目录」解析（与运行时所在目录无关）。
+#
+# 若芯片在 probe-rs 内置支持列表里（如多数 STM32），chip 节只写 name 即可，
+# 程序会自动用内置定义，无需 description / pack。
+# ===========================================================================
+
+version: 1
+
+probe:
+  protocol: swd            # swd | jtag；写错会直接报错
+  speed_khz: 1000          # 本板实测 >1000 kHz 不稳定，勿调高
+  # 只有一个探针时下面整段留空即可；多个探针时用来选定目标：
+  # selector:
+  #   vid: 0x1366          # SEGGER
+  #   # pid: 0x0101
+  #   # serial: "000123456789"
+
+chip:
+  name: GD32F503RE         # 必须与描述文件里的变体名精确一致
+  # probe-rs 内置列表没有 GD32F50x，所以必须给 target-gen 生成的描述文件：
+  description: ../uni_software/bsp/gd/targets/GD32F50x_Series.yaml
+  # 若描述文件缺失，程序会指引你用 target-gen 生成；这里顺便给出 pack 位置
+  # （v2 起程序可直接调用 target-gen 自动生成，当前版本仅用于拼错误提示）：
+  pack: ../probe-rs/GDF503_target_gen/GD32F50x_AddOn_V1.0.1/GigaDevice.GD32F50x_DFP.1.0.1.pack
+
+firmware:
+  # v1 尚未使用 ELF；保留此节，将来用于符号→地址解析与烧录
+  elf: ../uni_software/bsp/gd/build/Project.elf
+
+# ---------------------------------------------------------------------------
+# 若换成官方内置支持的芯片（例如 STM32F407VG），chip 节可简化成：
+#
+# chip:
+#   name: STM32F407VG
+#
+# （其余 probe / firmware 节不变，description / pack 直接删掉即可。）
+# ---------------------------------------------------------------------------
