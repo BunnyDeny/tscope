@@ -8,6 +8,7 @@
 //! - 配置里的相对路径一律相对「配置文件所在目录」解析，与运行目录无关；
 //! - 危险操作默认关闭（本工具 v1 只读内存，天然安全）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -24,9 +25,34 @@ pub struct ToolConfig {
     #[serde(default)]
     pub probe: ProbeConfig,
     pub chip: ChipConfig,
-    /// 固件相关配置；v1 尚未使用 ELF，字段先行保留
+    /// 固件相关配置；ELF 供 var / watch 子命令解析符号用
     #[serde(default)]
     pub firmware: FirmwareConfig,
+    /// 实时监视组：键是组名（`tscope watch <组名>` 的参数），可定义多组
+    #[serde(default)]
+    pub watch: BTreeMap<String, WatchGroup>,
+}
+
+/// 一个监视组：一组符号 + 采样周期
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchGroup {
+    /// 采样周期（毫秒）
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    /// 数组类型的符号在单元格里最多显示的元素个数
+    #[serde(default = "default_watch_max_elems")]
+    pub max_elems: usize,
+    /// 要监视的符号表达式列表（语法与 var 子命令相同，支持成员路径）
+    pub symbols: Vec<String>,
+}
+
+fn default_interval_ms() -> u64 {
+    100
+}
+
+fn default_watch_max_elems() -> usize {
+    8
 }
 
 /// 调试协议（serde 会把 yaml 里的 "swd"/"jtag" 转成枚举，写错直接报错）
@@ -99,7 +125,7 @@ pub struct ChipConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirmwareConfig {
-    /// 固件 ELF。v1 未使用；将来用于符号→地址解析与烧录
+    /// 固件 ELF：var / watch 子命令从这里解析符号的地址与类型
     #[serde(default)]
     pub elf: Option<PathBuf>,
 }
@@ -126,6 +152,25 @@ impl ToolConfig {
         }
         if config.probe.speed_khz == 0 {
             bail!("probe.speed_khz 不能为 0");
+        }
+        for (group, w) in &config.watch {
+            if group.trim().is_empty() {
+                bail!("watch 组的名字不能为空");
+            }
+            if w.interval_ms == 0 {
+                bail!("watch 组 {group} 的 interval_ms 不能为 0");
+            }
+            if w.max_elems == 0 {
+                bail!("watch 组 {group} 的 max_elems 不能为 0");
+            }
+            if w.symbols.is_empty() {
+                bail!("watch 组 {group} 的 symbols 不能为空");
+            }
+            for sym in &w.symbols {
+                if sym.trim().is_empty() {
+                    bail!("watch 组 {group} 里有空的符号表达式");
+                }
+            }
         }
         Ok(config)
     }

@@ -27,6 +27,9 @@ ENC_1_POS_SENSOR (positionStruct) = {
   - 成员路径：`ENC_1_POS_SENSOR.readAngleCmd`、`items[0].v.x`、`matrix[1][2]`
   - 数组默认显示前 16 个元素，`--count N` / `--all` 控制
   - 指针成员只显示地址（`NULL` 显示 NULL），位域明确提示暂不支持
+- `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
+  - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
+  - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU
 - 芯片由运行时查询 probe-rs 内置列表判定；内置没有的型号走「芯片描述 YAML」，
   缺文件时给出 target-gen 生成指引
 - 库直接内嵌：单进程，无中间服务；一次内存读取完成整个变量（含结构体）的采集
@@ -264,12 +267,41 @@ target-gen pack GigaDevice.GD32F50x_DFP.1.0.1.pack ./targets/
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `elf` | `var` 命令需要 | 固件 ELF 路径。`var` 从它的调试信息（DWARF）解析符号地址与类型 |
+| `elf` | `var` / `watch` 需要 | 固件 ELF 路径。从它的调试信息（DWARF）解析符号地址与类型 |
 
 **关键前提**：ELF 必须与**板上实际烧录的固件**是同一次构建的产物。
 烧的是旧固件、指了新 ELF，符号地址会对不上，读出来的是别的数据。
 另外符号的可见性受编译优化影响：`-O2` 下部分变量会被优化掉，
 读不到时报错提示用 `-O0` 重新编译。
+
+### `watch` —— 实时监视组
+
+定义 Keil Watch 风格的实时刷新窗口。键是组名（`tscope watch <组名>` 的参数），
+可定义任意多组：
+
+```yaml
+watch:
+  watch1:                  # 组名自定
+    interval_ms: 100       # 采样周期（毫秒），默认 100
+    max_elems: 8           # 复合类型最多展开的项数（数组元素/结构体成员），默认 8
+    symbols:               # 语法与 var 命令相同，支持成员路径/下标
+      - theta_ref
+      - led_ticker
+      - ENC_1_POS_SENSOR
+      - ENC_1_POS_SENSOR.readAngleCmd
+  watch2:
+    interval_ms: 500
+    symbols:
+      - cali_buff
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `interval_ms` | 否 | `100` | 采样周期（毫秒）。每个基础变量每周期只做一次内存读，采样期间不暂停 CPU |
+| `max_elems` | 否 | `8` | 复合类型（数组/结构体）展开成子项行的数量上限；超出部分显示「…余N」汇总行（修正 Keil 大数组全量刷屏的缺陷）。想全看就调大，或直接监视具体成员/下标（`cali_buff[20]`、`s.member`） |
+| `symbols` | **是** | — | 要监视的符号表达式列表 |
+
+运行 `tscope watch`（不带组名）可列出配置里定义的所有组。
 
 ---
 
@@ -299,9 +331,21 @@ tscope var matrix[1][2]                          # 多维下标
 
 # 指定配置文件
 tscope --config /path/to/tscope.yaml var theta_ref
+
+# 实时监视（Keil Watch 风格，q / Esc / Ctrl-C 退出）
+tscope watch                    # 列出配置里定义的所有监视组
+tscope watch watch1             # 打开 watch1 组的实时刷新表格
 ```
 
 `--count` 对多维数组**逐维生效**（每一维都截断到 N 个）。
+
+watch 表格四列：表达式 / 值 / 类型 / 地址。值发生变化的行黄色高亮
+（本采样周期内变化），读取失败红色显示；**复合类型展开成子项行**——
+数组展平为 `m[0][0]`、结构体展开为 `.member`（嵌套为 `.v.x`，结构体数组
+为 `items[0].v.x`），最多 `max_elems` 项，超出显示「…余N」汇总行；
+位域成员显示「〈位域暂不支持〉」占位行。行数超过终端高度时可用
+**↑/↓（或 j/k）、PgUp/PgDn、Home/End、鼠标滚轮**滚动，选中行深色高亮。
+退出时自动恢复终端，不留滚动垃圾。
 
 ---
 
@@ -321,7 +365,8 @@ tscope --config /path/to/tscope.yaml var theta_ref
 # 七、路线图
 
 - v2：✅ ELF 符号解析（标量 / 数组 / 结构体 / 联合体 / 枚举，嵌套 + 成员路径）
-- v3：⏳ `watch` 周期采样（J-Scope 雏形）；`chip.pack` 存在时自动调 target-gen
+- v3：✅ `watch` 实时监视（ratatui 交替屏表格，多组，Keil 风格高亮）；
+  ⏳ `chip.pack` 存在时自动调 target-gen
 - v4：固件侧 RTT 通道，`watch` 数据源升级为 RTT（高带宽）
 - v5：GUI（波形显示）
 

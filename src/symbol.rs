@@ -39,6 +39,7 @@ enum CompoundKind {
     Union,
 }
 
+#[derive(Debug, Clone)]
 struct Member {
     name: String,
     offset: usize,
@@ -46,7 +47,8 @@ struct Member {
 }
 
 /// 递归类型描述
-enum TypeDesc {
+#[derive(Debug, Clone)]
+pub(crate) enum TypeDesc {
     Base {
         name: String,
         byte_size: usize,
@@ -80,7 +82,7 @@ enum TypeDesc {
 }
 
 impl TypeDesc {
-    fn byte_size(&self) -> Option<usize> {
+    pub(crate) fn byte_size(&self) -> Option<usize> {
         match self {
             TypeDesc::Base { byte_size, .. }
             | TypeDesc::Pointer { byte_size, .. }
@@ -91,7 +93,7 @@ impl TypeDesc {
         }
     }
 
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             TypeDesc::Base { name, .. }
             | TypeDesc::Pointer { name, .. }
@@ -208,6 +210,211 @@ fn walk_path<'a>(root: &'a TypeDesc, path: &[PathSeg]) -> Result<(usize, &'a Typ
     Ok((offset, cur))
 }
 
+/// 解析完成、可重复采样的符号。
+/// 解析只做一次（ELF/DWARF 全部是 CPU 工作），采样每次只做一次内存读。
+/// 解析完成、可重复采样的符号。
+/// 解析只做一次（ELF/DWARF 全部是 CPU 工作），采样每次只做一次内存读。
+#[derive(Clone)]
+pub struct PreparedSymbol {
+    /// 基础变量的地址（成员路径相对它的偏移）
+    address: u64,
+    /// 基础变量的字节数
+    base_size: usize,
+    /// 目标字段在基础变量内的偏移
+    field_offset: usize,
+    /// 目标字段的类型描述
+    field_ty: TypeDesc,
+}
+
+impl PreparedSymbol {
+    /// 目标字段的绝对地址
+    pub fn field_address(&self) -> u64 {
+        self.address + self.field_offset as u64
+    }
+
+    pub fn type_name(&self) -> &str {
+        self.field_ty.name()
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.field_ty.byte_size().unwrap_or(0)
+    }
+
+    /// 读整个基础变量（**一次**内存读）。多个数组元素行共享这份缓冲区。
+    pub fn read_base(&self, core: &mut Core) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.base_size];
+        core.read_8(self.address, &mut buf).with_context(|| {
+            format!(
+                "读取 0x{:08x}（{} 字节）失败",
+                self.address, self.base_size
+            )
+        })?;
+        Ok(buf)
+    }
+
+    /// 若目标字段是复合类型（数组/结构体/联合体），展开为子项行列表
+    /// （**最多 max_elems 个**，修正 Keil 全量刷屏的缺陷）：
+    /// 返回（子项行, 未显示的剩余项数）。
+    /// 子项行 = （显示标签后缀，相对字段的字节偏移, 项类型）。
+    /// 标签以 `.` 或 `[` 开头，便于调用方拼在表达式后面：
+    ///   结构体成员 → `.member`（嵌套为 `.v.x`）
+    ///   数组元素   → `[i]`（多维为 `[i][j]`）
+    /// 数组与结构体可任意交错（结构体数组 → `.member[i]` 等）。
+    /// 非复合类型返回 None。
+    pub fn child_rows(&self, max_elems: usize) -> Option<(Vec<(String, usize, TypeDesc)>, usize)> {
+        let total = leaf_count(&self.field_ty);
+        match &self.field_ty {
+            TypeDesc::Array { .. } | TypeDesc::Struct { .. } => {
+                let mut out = Vec::new();
+                collect_child_rows(&self.field_ty, 0, "", max_elems, &mut out);
+                let remaining = total.saturating_sub(out.len());
+                Some((out, remaining))
+            }
+            _ => None,
+        }
+    }
+
+    /// 从已读回的基础缓冲区渲染指定偏移处的元素为**单行**文本
+    pub fn render_at(&self, buf: &[u8], offset: usize, ty: &TypeDesc) -> String {
+        let size = ty.byte_size().unwrap_or(0);
+        let start = self.field_offset + offset;
+        let slice = buf.get(start..start + size).unwrap_or(&[]);
+        render_compact(slice, ty)
+    }
+
+    /// 从已读回的基础缓冲区渲染目标字段本身（单行）
+    pub fn render_self(&self, buf: &[u8]) -> String {
+        self.render_at(buf, 0, &self.field_ty)
+    }
+
+    /// 采样缓冲区分组缓存用：标识同一个基础变量
+    pub(crate) fn base_key(&self) -> (u64, usize) {
+        (self.address, self.base_size)
+    }
+
+    /// 采样一次：读整个基础变量（单次内存读），把目标字段渲染成**单行**文本。
+    /// 标量照常显示；结构体/联合体折叠为「类型名 (N 字节)」。
+    /// （数组请用 array_rows() 展开成多行。）
+    pub fn sample(&self, core: &mut Core) -> Result<String> {
+        let buf = self.read_base(core)?;
+        Ok(self.render_self(&buf))
+    }
+}
+
+/// 展平后的标量叶子总数（用于统计未显示的剩余量）
+fn leaf_count(ty: &TypeDesc) -> usize {
+    match ty {
+        TypeDesc::Array { elem, count, .. } => count * leaf_count(elem),
+        TypeDesc::Struct { members, .. } => members.iter().map(|m| leaf_count(&m.ty)).sum(),
+        _ => 1,
+    }
+}
+
+/// 递归展平复合类型：结构体成员用 `.name`、数组元素用 `[i]` 进入标签；
+/// 到达 budget 即停止
+fn collect_child_rows(
+    ty: &TypeDesc,
+    base_off: usize,
+    label: &str,
+    budget: usize,
+    out: &mut Vec<(String, usize, TypeDesc)>,
+) {
+    if out.len() >= budget {
+        return;
+    }
+    match ty {
+        TypeDesc::Array { elem, count, .. } => {
+            let Some(elem_size) = elem.byte_size() else {
+                out.push((format!("{label}[…]"), base_off, ty.clone()));
+                return;
+            };
+            for i in 0..*count {
+                if out.len() >= budget {
+                    return;
+                }
+                collect_child_rows(
+                    elem,
+                    base_off + i * elem_size,
+                    &format!("{label}[{i}]"),
+                    budget,
+                    out,
+                );
+            }
+        }
+        TypeDesc::Struct { members, .. } => {
+            for m in members {
+                if out.len() >= budget {
+                    return;
+                }
+                collect_child_rows(&m.ty, base_off + m.offset, &format!("{label}.{}", m.name), budget, out);
+            }
+        }
+        // 标量 / 指针 / 枚举 / 位域（不支持占位）：叶子行
+        other => out.push((label.to_string(), base_off, other.clone())),
+    }
+}
+
+/// watch 单元格用的紧凑渲染：全部结果保证单行。
+/// - 标量 / 指针 / 枚举：正常值
+/// - 数组：`[v0, v1, …]`（防御分支：watch 顶层数组已展开成多行，正常不会走到；
+///   仅嵌套在结构体等场景可能触达，最多内联 8 个元素）
+/// - 结构体 / 联合体 / 不支持类型：折叠为「类型名 (N 字节)」或占位说明
+const MAX_INLINE_ELEMS: usize = 8;
+
+fn render_compact(buf: &[u8], ty: &TypeDesc) -> String {
+    match ty {
+        TypeDesc::Array { elem, count, .. } => {
+            let Some(elem_size) = elem.byte_size() else {
+                return format!("{} (元素暂不支持)", ty.name());
+            };
+            let shown = (*count).min(MAX_INLINE_ELEMS);
+            let mut parts: Vec<String> = Vec::new();
+            for i in 0..shown {
+                match buf.get(i * elem_size..(i + 1) * elem_size) {
+                    Some(slice) => parts.push(render_compact(slice, elem)),
+                    None => parts.push("?".to_string()),
+                }
+            }
+            if shown < *count {
+                parts.push(format!("…余{}", count - shown));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        TypeDesc::Struct { .. } => {
+            format!("{} ({} 字节)", ty.name(), ty.byte_size().unwrap_or(0))
+        }
+        TypeDesc::Unsupported { reason, .. } => format!("〈{reason}〉"),
+        // 标量 / 指针 / 枚举：复用单行渲染
+        _ => render(
+            buf,
+            ty,
+            &FmtOptions {
+                max_elems: Some(MAX_INLINE_ELEMS),
+                max_depth: 1,
+            },
+            0,
+        ),
+    }
+}
+
+/// 解析表达式为可采样符号（不读内存）
+pub fn prepare_symbol(elf_path: &Path, expr: &str) -> Result<PreparedSymbol> {
+    let (base, path) = parse_expr(expr)?;
+    let info = find_symbol(elf_path, &base)?;
+    let (field_offset, field_ty) = walk_path(&info.ty, &path)?;
+    let base_size = info
+        .ty
+        .byte_size()
+        .ok_or_else(|| anyhow!("符号 {base} 的类型暂不支持（{}）", info.ty.name()))?;
+
+    Ok(PreparedSymbol {
+        address: info.address,
+        base_size,
+        field_offset,
+        field_ty: field_ty.clone(),
+    })
+}
+
 /// 查找名为 `symbol` 的全局/静态变量，读出其值并打印。
 pub fn print_global_value(
     elf_path: &Path,
@@ -215,45 +422,43 @@ pub fn print_global_value(
     core: &mut Core,
     opts: &FmtOptions,
 ) -> Result<()> {
-    let (base, path) = parse_expr(expr)?;
-    let info = find_symbol(elf_path, &base)?;
-
-    // 沿路径走到目标字段（纯偏移计算，不读内存）
-    let (field_offset, field_ty) = walk_path(&info.ty, &path)?;
+    let prepared = prepare_symbol(elf_path, expr)?;
 
     // 唯一一次内存读：读整个基础变量（目标字段也在其中）
-    let base_size = info
-        .ty
-        .byte_size()
-        .ok_or_else(|| anyhow!("符号 {base} 的类型暂不支持（{}）", info.ty.name()))?;
-    let mut buf = vec![0u8; base_size];
-    core.read_8(info.address, &mut buf).with_context(|| {
+    let mut buf = vec![0u8; prepared.base_size];
+    core.read_8(prepared.address, &mut buf).with_context(|| {
         format!(
-            "读取符号 {base} 失败（地址 0x{:08x}，{} 字节）",
-            info.address, base_size
+            "读取符号 {expr} 失败（地址 0x{:08x}，{} 字节）",
+            prepared.address, prepared.base_size
         )
     })?;
 
-    let field_size = field_ty
-        .byte_size()
-        .ok_or_else(|| anyhow!("字段 {expr} 的类型暂不支持（{}）", field_ty.name()))?;
-    let slice = buf.get(field_offset..field_offset + field_size).ok_or_else(|| {
-        anyhow!(
-            "字段数据越界：偏移 {field_offset} 大小 {field_size}，但 {base} 只有 {base_size} 字节"
-        )
-    })?;
+    let size = prepared.byte_size();
+    let slice = buf
+        .get(prepared.field_offset..prepared.field_offset + size)
+        .ok_or_else(|| {
+            anyhow!(
+                "字段数据越界：偏移 {} 大小 {size}，但基础变量只有 {} 字节",
+                prepared.field_offset,
+                prepared.base_size
+            )
+        })?;
 
-    let rendered = render(slice, field_ty, opts, 0);
+    let rendered = render(slice, &prepared.field_ty, opts, 0);
 
     if rendered.contains('\n') {
-        println!("{expr} ({}) = {}", field_ty.name(), rendered.trim_start());
+        println!(
+            "{expr} ({}) = {}",
+            prepared.field_ty.name(),
+            rendered.trim_start()
+        );
     } else {
         println!("{expr} = {rendered}");
     }
     println!(
         "类型: {}    地址: 0x{:08x}",
-        field_ty.name(),
-        info.address + field_offset as u64
+        prepared.field_ty.name(),
+        prepared.field_address()
     );
     Ok(())
 }

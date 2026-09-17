@@ -11,6 +11,7 @@
 mod config;
 mod session;
 mod symbol;
+mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,12 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+
+    /// 实时刷新监视组（Keil Watch 风格；组定义在 tscope.yaml 的 watch 节）
+    Watch {
+        /// 监视组名（对应 tscope.yaml 里 watch 节的键）；省略则列出所有组
+        group: Option<String>,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64> {
@@ -101,6 +108,13 @@ fn main() -> Result<()> {
                 max_depth: 3,
             };
             symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+        }
+        Cmd::Watch { group } => {
+            let config = load_config(&cli.config)?;
+            match group {
+                Some(g) => watch::run(&config, &g),
+                None => watch::list_groups(&config),
+            }
         }
     }
 }

@@ -28,8 +28,36 @@ chip:
   pack: ../probe-rs/GDF503_target_gen/GD32F50x_AddOn_V1.0.1/GigaDevice.GD32F50x_DFP.1.0.1.pack
 
 firmware:
-  # v1 尚未使用 ELF；保留此节，将来用于符号→地址解析与烧录
+  # var / watch 子命令从这里解析符号的地址与类型
   elf: ../uni_software/bsp/gd/build/Project.elf
+
+# ---------------------------------------------------------------------------
+# 实时监视组（tscope watch <组名>，Keil Watch 风格）
+# - 组名自定（watch1 / watch2 / 任意名字），可定义多组
+# - symbols 的语法与 var 命令相同，支持成员路径与数组下标
+# - interval_ms 是采样周期（毫秒）
+# - max_elems 是复合类型（数组/结构体）最多展开的项数（默认 8）；
+#   超出部分显示「…余N」汇总行——修正 Keil 大数组全量刷屏的缺陷
+# ---------------------------------------------------------------------------
+watch:
+  watch1:
+    interval_ms: 100
+    symbols:
+      - theta_ref
+      - led_ticker
+      - ENC_1_POS_SENSOR.position
+      - ENC_1_POS_SENSOR.readAngleCmd
+      - ENC_1_POS_SENSOR
+  watch2:
+    interval_ms: 500
+    max_elems: 8          # cali_buff 共 8 个元素，恰好全部展开
+    symbols:
+      - cali_buff
+  watch3:
+    interval_ms: 500
+    max_elems: 200 
+    symbols:
+      - ENC_1_POS_SENSOR.velocity_filter
 
 # ---------------------------------------------------------------------------
 # 若换成官方内置支持的芯片（例如 STM32F407VG），chip 节可简化成：

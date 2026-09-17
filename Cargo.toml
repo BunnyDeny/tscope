@@ -19,3 +19,6 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 serde = { version = "1", features = ["derive"] }
 # serde_yaml 已停止维护；yaml_serde 是社区接班版本，probe-rs 自身也用它（0.10）
 yaml_serde = "0.10"
+
+# TUI：watch 子命令的实时刷新表格（交替屏幕，退出自动恢复终端）
+ratatui = "0.30"
