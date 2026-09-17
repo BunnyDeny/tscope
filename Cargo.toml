@@ -8,9 +8,9 @@ description = "基于 probe-rs 库的嵌入式调试/监视工具（YAML 配置�
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
-# 当前以本地源码 checkout（v0.32.0）作为依赖，与本项目 dap-server 用的是同一份代码。
-# 相对路径从 tscope 仓库根出发：../probe-rs/probe-rs（两者是同级目录）。
-probe-rs = { path = "../probe-rs/probe-rs" }
+# probe-rs：来自 crates.io，cargo build 时自动下载，无需手动克隆其源码。
+# 版本锁定 0.32（与本工具开发时使用的版本一致；上游 API 变更时再显式升级）。
+probe-rs = "0.32"
 
 # 直接解析 ELF / DWARF 调试信息（symbol.rs 只查目标符号，避免官方机制的全量扫描）
 gimli = "0.34"
