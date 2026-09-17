@@ -30,6 +30,13 @@ ENC_1_POS_SENSOR (positionStruct) = {
 - `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
   - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
   - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU
+- `debug`：交互式调试会话（提示符 `> `，readline 行编辑：左右光标、↑/↓ 历史命令且跨会话保存）
+  - **持久断点集**（会话内有效）：`bp` 添加（地址 / 函数名 / **文件:行号** 三种写法）、`bl` 列出、`bc` 删除
+  - 断点命中/暂停时显示 `文件:行号 + 函数名`（DWARF 行号表反查）；`reset` 后自动重新应用断点
+  - `list`（l）显示当前 PC 附近源码 ±5 行（gdb 风格 `=>` 标记当前行）；
+    路径来自 ELF 编译时记录——源码在本机则直接显示，不在则明确报错（零强制依赖）
+  - 全速运行、暂停、单步、寄存器、复位到 main；会话内可随时 `var` 读全局变量、`watch` 持续监视（q 返回提示符，会话不断）
+  - 单条命令出错不影响会话；只支持硬件断点（8 个上限），不碰 flash，bootloader 安全
 - 芯片由运行时查询 probe-rs 内置列表判定；内置没有的型号走「芯片描述 YAML」，
   缺文件时给出 target-gen 生成指引
 - 库直接内嵌：单进程，无中间服务；一次内存读取完成整个变量（含结构体）的采集
@@ -335,6 +342,18 @@ tscope --config /path/to/tscope.yaml var theta_ref
 # 实时监视（Keil Watch 风格，q / Esc / Ctrl-C 退出）
 tscope watch                    # 列出配置里定义的所有监视组
 tscope watch watch1             # 打开 watch1 组的实时刷新表格
+
+# 交互式调试会话
+tscope debug                    # 进入提示符 "> "，输入 help 查看命令
+> bp foc.c:123                  # 断点：文件:行号（也可写函数名/十六进制地址）
+> bp main                       # 再添一个；bl 列出全部；bc 1 / bc all 删除
+> run                           # 全速运行，命中任断点停下并报 文件:行号+函数
+> halt                          # 暂停；step 单步；regs 寄存器；pc 看 PC/SP/LR
+> list                          # 显示当前 PC 附近源码（l 同义；也可 l port.c:244）
+> reset                         # 复位并暂停在 main 开头（rst 同义；可指定函数）
+> var theta_ref                 # 一次性读全局变量
+> watch watch1                  # 全屏持续监视，q 返回提示符（会话不断）
+> q                             # 退出会话
 ```
 
 `--count` 对多维数组**逐维生效**（每一维都截断到 N 个）。
@@ -366,7 +385,8 @@ watch 表格四列：表达式 / 值 / 类型 / 地址。值发生变化的行�
 
 - v2：✅ ELF 符号解析（标量 / 数组 / 结构体 / 联合体 / 枚举，嵌套 + 成员路径）
 - v3：✅ `watch` 实时监视（ratatui 交替屏表格，多组，Keil 风格高亮）；
-  ⏳ `chip.pack` 存在时自动调 target-gen
+  ✅ `debug` 交互式调试会话（断点/运行/单步/寄存器，watch 可嵌套）；
+  ⏳ 调试会话内查看局部变量；`chip.pack` 存在时自动调 target-gen
 - v4：固件侧 RTT 通道，`watch` 数据源升级为 RTT（高带宽）
 - v5：GUI（波形显示）
 

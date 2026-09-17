@@ -9,6 +9,7 @@
 //! - 库直接内嵌：本程序就是唯一进程，直接经 SWD 访问芯片，无中间服务。
 
 mod config;
+mod debug;
 mod session;
 mod symbol;
 mod watch;
@@ -68,6 +69,9 @@ enum Cmd {
         /// 监视组名（对应 tscope.yaml 里 watch 节的键）；省略则列出所有组
         group: Option<String>,
     },
+
+    /// 进入交互式调试会话（提示符 "> "，输入 help 查看命令）
+    Debug,
 }
 
 fn parse_hex(s: &str) -> Result<u64> {
@@ -115,6 +119,10 @@ fn main() -> Result<()> {
                 Some(g) => watch::run(&config, &g),
                 None => watch::list_groups(&config),
             }
+        }
+        Cmd::Debug => {
+            let config = load_config(&cli.config)?;
+            debug::run(&config)
         }
     }
 }

@@ -60,6 +60,16 @@ pub fn list_groups(config: &ToolConfig) -> Result<()> {
 
 /// 启动 watch 界面。q / Esc / Ctrl-C 退出。
 pub fn run(config: &ToolConfig, group: &str) -> Result<()> {
+    let mut session = session::open_session(&config.probe, &config.chip)?;
+    run_with_session(config, group, &mut session)
+}
+
+/// 复用已有调试会话进入 watch 界面（debug 会话里调用，避免重复占用探针）
+pub fn run_with_session(
+    config: &ToolConfig,
+    group: &str,
+    session: &mut probe_rs::Session,
+) -> Result<()> {
     let g = config.watch.get(group).ok_or_else(|| {
         let names: Vec<String> = config.watch.keys().cloned().collect();
         if names.is_empty() {
@@ -133,11 +143,13 @@ pub fn run(config: &ToolConfig, group: &str) -> Result<()> {
         }
     }
 
-    // 会话（一次性）：后续采样复用同一个 session
-    let mut session = session::open_session(&config.probe, &config.chip)?;
+    // 会话复用：调用方传入的 session（采样期间持续使用）
 
-    // TUI 生命周期：init 进交替屏，restore 恢复终端（即使中途出错也恢复）
-    let mut terminal = ratatui::init();
+    // TUI 生命周期：进交替屏，restore 恢复终端（即使中途出错也恢复）。
+    // 用 try_init 而不是 init：无 TTY（管道/重定向）时返回错误而非 panic，
+    // 保证 debug 会话里单条命令失败不炸掉整个会话。
+    let mut terminal = ratatui::try_init()
+        .context("初始化终端失败（watch 需要真实终端，不能运行在管道/重定向下）")?;
     // 开启鼠标捕获（滚轮滚动表格）
     let _ = std::io::stdout().execute(event::EnableMouseCapture);
     let mut state = TableState::default();
@@ -146,7 +158,7 @@ pub fn run(config: &ToolConfig, group: &str) -> Result<()> {
     }
     let res = run_loop(
         &mut terminal,
-        &mut session,
+        session,
         &mut rows,
         group,
         g.interval_ms,
@@ -387,6 +399,4 @@ fn run_loop(
             }
         }
     }
-
-    Ok(())
 }

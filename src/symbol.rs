@@ -27,20 +27,20 @@ use probe_rs::{Core, MemoryInterface};
 
 /// 基类型编码（对应 DWARF 的 DW_ATE_*）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Encoding {
+pub(crate) enum Encoding {
     Float,
     Signed,
     Unsigned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompoundKind {
+pub(crate) enum CompoundKind {
     Struct,
     Union,
 }
 
 #[derive(Debug, Clone)]
-struct Member {
+pub(crate) struct Member {
     name: String,
     offset: usize,
     ty: TypeDesc,
@@ -290,14 +290,6 @@ impl PreparedSymbol {
     /// 采样缓冲区分组缓存用：标识同一个基础变量
     pub(crate) fn base_key(&self) -> (u64, usize) {
         (self.address, self.base_size)
-    }
-
-    /// 采样一次：读整个基础变量（单次内存读），把目标字段渲染成**单行**文本。
-    /// 标量照常显示；结构体/联合体折叠为「类型名 (N 字节)」。
-    /// （数组请用 array_rows() 展开成多行。）
-    pub fn sample(&self, core: &mut Core) -> Result<String> {
-        let buf = self.read_base(core)?;
-        Ok(self.render_self(&buf))
     }
 }
 
@@ -618,6 +610,340 @@ fn symbol_table_address<'data>(
         }
     }
     Ok(0)
+}
+
+/// 查函数符号的地址（debug 的 bp 命令用）。
+/// Cortex-M 是 Thumb 架构，符号地址最低位是 1（Thumb 标记），
+/// 断点地址必须是偶数指令地址，这里统一清掉最低位。
+pub fn code_symbol_address(elf_path: &Path, name: &str) -> Result<u64> {
+    let data =
+        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let obj = object::File::parse(&*data).context("解析 ELF 失败")?;
+    let addr = symbol_table_address(&obj, name)?;
+    if addr == 0 {
+        bail!(
+            "在 ELF 符号表里没有找到符号 {name}：\n\
+             检查拼写；局部变量与静态函数（static）不会出现在符号表里。"
+        );
+    }
+    Ok(addr & !1)
+}
+
+/// 反查：包含 addr 的函数符号名（断点命中提示用）。找不到返回 None。
+/// 取「起始地址最大且覆盖 addr」的 Text 符号，即最内层函数。
+pub fn function_name_at(elf_path: &Path, addr: u64) -> Option<String> {
+    let data = std::fs::read(elf_path).ok()?;
+    let obj = object::File::parse(&*data).ok()?;
+    let addr = addr & !1; // 清 Thumb 位
+    let mut best: Option<(u64, String)> = None;
+    for sym in obj.symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let start = sym.address() & !1;
+        let size = sym.size();
+        if start <= addr && addr < start + size {
+            let better = best.as_ref().is_none_or(|(bs, _)| start > *bs);
+            if better {
+                if let Ok(name) = sym.name() {
+                    best = Some((start, name.to_string()));
+                }
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
+// ===========================================================================
+// 行号表：file:line ↔ 地址
+// ===========================================================================
+
+/// 加载 ELF 的 DWARF 并执行闭包（行号表查询等一次性用途）
+fn with_dwarf<T>(
+    elf_path: &Path,
+    f: impl FnOnce(&Dwarf<EndianRcSlice<RunTimeEndian>>) -> Result<T>,
+) -> Result<T> {
+    let data =
+        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let obj = object::File::parse(&*data).context("解析 ELF 失败（确认文件是 .elf）")?;
+
+    let endian = if obj.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+
+    let mut load_section =
+        |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
+            let bytes = obj
+                .section_by_name(id.name())
+                .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
+                .unwrap_or_default();
+            Ok(EndianRcSlice::new(
+                std::rc::Rc::from(bytes.as_slice()),
+                endian,
+            ))
+        };
+    let dwarf_sections =
+        gimli::DwarfSections::load(&mut load_section).context("加载 DWARF 调试信息失败")?;
+    let dwarf = dwarf_sections.borrow(|section| section.clone());
+    f(&dwarf)
+}
+
+/// 属性值 → 字符串（DW_AT_string 等）
+fn attr_value_string<R: Reader<Offset = usize>>(
+    dwarf: &Dwarf<R>,
+    unit: &Unit<R>,
+    value: AttributeValue<R>,
+) -> Option<String> {
+    dwarf
+        .attr_string(unit, value)
+        .ok()?
+        .to_string_lossy()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// 路径匹配强度：3 = 精确，2 = 后缀（组件边界），1 = 基名；不匹配返回 None
+fn path_match_strength(candidate: &str, wanted: &str) -> Option<u32> {
+    let norm = |s: &str| s.replace('\\', "/");
+    let c = norm(candidate);
+    let w = norm(wanted);
+    if c == w {
+        return Some(3);
+    }
+    if c.ends_with(&format!("/{w}")) {
+        return Some(2);
+    }
+    if std::path::Path::new(&c).file_name() == std::path::Path::new(&w).file_name() {
+        return Some(1);
+    }
+    None
+}
+
+/// 构建行号程序的文件表：索引 → 完整路径字符串
+fn build_file_paths<R: Reader<Offset = usize>>(
+    dwarf: &Dwarf<R>,
+    unit: &Unit<R>,
+    header: &gimli::LineProgramHeader<R, usize>,
+) -> Vec<String> {
+    let comp_dir = unit
+        .comp_dir
+        .as_ref()
+        .and_then(|s| s.to_string_lossy().ok())
+        .map(|s| s.into_owned());
+
+    let mut paths = Vec::new();
+    // DWARF5 起索引 0 是当前编译文件；旧版本索引 0 保留给当前文件但不在
+    // file_names 里（本项目固件是 DWARF5；取不到就留空串，行引用它时不匹配）
+    for idx in 0..=header.file_names().len() {
+        paths.push(resolve_file_path(
+            dwarf,
+            unit,
+            header,
+            idx as u64,
+            comp_dir.as_deref(),
+        ));
+    }
+    paths
+}
+
+/// 解析单个文件条目为完整路径（comp_dir + 目录表 + 文件名）
+fn resolve_file_path<R: Reader<Offset = usize>>(
+    dwarf: &Dwarf<R>,
+    unit: &Unit<R>,
+    header: &gimli::LineProgramHeader<R, usize>,
+    file_index: u64,
+    comp_dir: Option<&str>,
+) -> String {
+    let Some(entry) = header.file(file_index) else {
+        return String::new();
+    };
+    let name = attr_value_string(dwarf, unit, entry.path_name()).unwrap_or_default();
+    if is_absolute_path(&name) {
+        return name;
+    }
+
+    // 目录表条目：可能是相对路径（拼在 comp_dir 后面），也可能是绝对路径
+    // （GCC 常把源文件的绝对目录放进 include_directories 表）
+    let dir = entry
+        .directory(header)
+        .and_then(|v| attr_value_string(dwarf, unit, v));
+
+    match dir.as_deref() {
+        Some(d) if !d.is_empty() && d != "." => {
+            if is_absolute_path(d) {
+                format!("{d}/{name}")
+            } else if let Some(c) = comp_dir.filter(|c| !c.is_empty()) {
+                format!("{c}/{d}/{name}")
+            } else {
+                format!("{d}/{name}")
+            }
+        }
+        _ => match comp_dir.filter(|c| !c.is_empty()) {
+            Some(c) => format!("{c}/{name}"),
+            None => name,
+        },
+    }
+}
+
+fn is_absolute_path(s: &str) -> bool {
+    s.starts_with('/') || s.get(1..3) == Some(":\\")
+}
+
+/// 收集行号表里与 wanted 匹配的所有文件路径（去重，保留各自最高匹配强度）
+fn collect_matching_files(
+    dwarf: &Dwarf<EndianRcSlice<RunTimeEndian>>,
+    wanted: &str,
+) -> Vec<(u32, String)> {
+    let mut found: Vec<(u32, String)> = Vec::new();
+    let mut units = dwarf.units();
+    while let Ok(Some(header)) = units.next() {
+        let Ok(unit) = dwarf.unit(header) else { continue };
+        let Some(program) = unit.line_program.clone() else {
+            continue;
+        };
+        for path in build_file_paths(dwarf, &unit, program.header()) {
+            if path.is_empty() {
+                continue;
+            }
+            let Some(strength) = path_match_strength(&path, wanted) else {
+                continue;
+            };
+            match found.iter_mut().find(|(_, p)| *p == path) {
+                Some((s, _)) => *s = (*s).max(strength),
+                None => found.push((strength, path)),
+            }
+        }
+    }
+    found
+}
+
+/// 把用户写的路径（完整/后缀/基名）解析成 ELF 行号表里的完整路径；
+/// 同一级别匹配到多个文件时报歧义。list 命令用。
+pub fn resolve_source_path(elf_path: &Path, wanted: &str) -> Result<String> {
+    with_dwarf(elf_path, |dwarf| {
+        let found = collect_matching_files(dwarf, wanted);
+        let Some(max_strength) = found.iter().map(|f| f.0).max() else {
+            bail!("行号表里没有找到源文件 {wanted}（支持完整路径/后缀/文件名匹配）");
+        };
+        let tops: Vec<&str> = found
+            .iter()
+            .filter(|f| f.0 == max_strength)
+            .map(|f| f.1.as_str())
+            .collect();
+        if tops.len() > 1 {
+            let list = tops
+                .iter()
+                .map(|p| format!("  {p}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!("{wanted} 匹配到多个文件：\n{list}\n请把路径写得更具体");
+        }
+        Ok(tops[0].to_string())
+    })
+}
+
+/// 行号表正查：file:line → 该行第一条指令地址（bp 用）。
+/// 路径三级匹配：精确 → 后缀 → 基名；同一级别匹配到多个文件时报歧义。
+pub fn line_to_address(elf_path: &Path, wanted: &str, line: u64) -> Result<u64> {
+    // (匹配强度, 地址, 实际文件路径)
+    let mut candidates: Vec<(u32, u64, String)> = Vec::new();
+
+    with_dwarf(elf_path, |dwarf| {
+        let mut units = dwarf.units();
+        while let Some(header) = units.next().context("遍历编译单元失败")? {
+            let unit = dwarf.unit(header)?;
+            let Some(program) = unit.line_program.clone() else {
+                continue;
+            };
+            let paths = build_file_paths(dwarf, &unit, program.header());
+            let mut rows = program.rows();
+            while let Some((_, row)) = rows.next_row().context("遍历行号表失败")? {
+                if row.line().map(std::num::NonZeroU64::get) != Some(line) {
+                    continue;
+                }
+                let Some(path) = paths.get(row.file_index() as usize) else {
+                    continue;
+                };
+                if path.is_empty() {
+                    continue;
+                }
+                if let Some(strength) = path_match_strength(path, wanted) {
+                    candidates.push((strength, row.address() & !1, path.clone()));
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    let Some(max_strength) = candidates.iter().map(|c| c.0).max() else {
+        bail!(
+            "在行号表里没有找到 {wanted}:{line}：\n\
+             该行可能没有可执行代码，或路径写法不匹配（支持完整路径/后缀/文件名匹配）"
+        );
+    };
+
+    // 同级最强匹配里按"实际文件"去重；多于一个文件 → 报歧义
+    let mut files: Vec<(String, u64)> = Vec::new();
+    for (strength, addr, path) in candidates {
+        if strength != max_strength {
+            continue;
+        }
+        if !files.iter().any(|(p, _)| *p == path) {
+            files.push((path, addr));
+        }
+    }
+    if files.len() > 1 {
+        let list = files
+            .iter()
+            .map(|(p, _)| format!("  {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!("{wanted} 匹配到多个文件：\n{list}\n请把路径写得更具体");
+    }
+
+    Ok(files[0].1)
+}
+
+/// 行号表反查：地址 → (文件, 行号)。断点命中/暂停时展示用。
+pub fn address_to_line(elf_path: &Path, addr: u64) -> Option<(String, u64)> {
+    let addr = addr & !1;
+    // (地址, 文件, 行号)，取地址 ≤ addr 的最近一行
+    let mut best: Option<(u64, String, u64)> = None;
+
+    let _ = with_dwarf(elf_path, |dwarf| {
+        let mut units = dwarf.units();
+        while let Some(header) = units.next()? {
+            let unit = dwarf.unit(header)?;
+            let Some(program) = unit.line_program.clone() else {
+                continue;
+            };
+            let paths = build_file_paths(dwarf, &unit, program.header());
+            let mut rows = program.rows();
+            while let Some((_, row)) = rows.next_row()? {
+                let row_addr = row.address();
+                if row_addr > addr {
+                    break; // 行号表按地址递增，可提前退出
+                }
+                let Some(line) = row.line() else { continue };
+                let path = paths
+                    .get(row.file_index() as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                if path.is_empty() {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(ba, _, _)| row_addr >= *ba) {
+                    best = Some((row_addr, path, line.get()));
+                }
+            }
+        }
+        Ok(())
+    });
+
+    best.filter(|(_, p, _)| !p.is_empty())
+        .map(|(_, p, l)| (p, l))
 }
 
 /// 提取静态变量的地址：DW_AT_location 通常是常量地址（DW_OP_addr）
