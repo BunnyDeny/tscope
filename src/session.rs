@@ -92,7 +92,26 @@ fn resolve_target(registry: &mut Registry, chip: &ChipConfig) -> Result<Target> 
                  或换用正确的 CMSIS-Pack 重新生成描述文件。",
                 desc_path.display()
             ),
-            other => anyhow!("查询芯片 {name} 失败：{other}"),
+            // chip.name 写得太短，前缀匹配命中多个型号，无法唯一确定
+            RegistryError::ChipNotUnique(matched, candidates) => anyhow!(
+                "chip.name \"{matched}\" 匹配到多个型号（{candidates}），无法唯一确定：\n\
+                 请把 chip.name 写成完整型号名（可用 grep \"^- name:\" 查看描述文件里的全部变体）。"
+            ),
+            RegistryError::ChipAutodetectFailed => {
+                anyhow!("无法自动识别连接的芯片：请在配置里显式指定 chip.name。")
+            }
+            // 描述文件里的内核类型当前 probe-rs 版本不认识
+            RegistryError::UnknownCoreType(core_type) => anyhow!(
+                "描述文件里 {name} 的内核类型 \"{core_type}\" 当前 probe-rs 版本不支持：\n\
+                 请升级 probe-rs，或检查所用的 CMSIS-Pack 是否与该芯片匹配。"
+            ),
+            RegistryError::Io(e) => anyhow!("读取芯片描述文件时发生 IO 错误：{e}"),
+            RegistryError::Yaml(e) => anyhow!("芯片描述文件 YAML 解析失败：{e}"),
+            // 数据级校验失败（校验发生在 get_target_by_name，而非加载时）
+            RegistryError::InvalidChipFamilyDefinition(family, reason) => anyhow!(
+                "芯片描述文件的数据校验未通过（家族 {}）：{reason}",
+                family.name
+            ),
         });
     }
 
