@@ -68,16 +68,22 @@ cargo build --release
 ./target/release/tscope list                       # 列探针，排查连接问题
 ./target/release/tscope read                       # 读 0x20000000 一个 32 位字
 ./target/release/tscope read --address 0x20000000 --count 4
-./target/release/tscope var theta_ref              # 按符号名读全局变量（float/int/uint8_t 等）
+./target/release/tscope var theta_ref              # 标量全局变量（float/int/uint8_t 等）
+./target/release/tscope var ENC_1_POS_SENSOR       # 结构体（多行树形打印，含成员类型）
+./target/release/tscope var cali_buff              # 数组（默认前 16 个元素，--count N / --all）
+./target/release/tscope var ENC_1_POS_SENSOR.readAngleCmd   # 成员路径访问
+./target/release/tscope var items[0].v.x           # 嵌套路径：数组下标 + 结构体成员
 ./target/release/tscope --config /path/to/tscope.yaml read
 ```
 
 `var` 子命令：从配置里 `firmware.elf` 的调试信息（DWARF）解析符号的地址与类型，
-经调试口读取后按类型打印；全程不暂停 CPU。符号被编译器优化掉或不存在时报错退出。
+经调试口一次读回后按类型打印；全程不暂停 CPU。支持标量 / 数组（含多维）/
+结构体 / 联合体 / 枚举，任意嵌套；支持成员路径（`.member`、`[i]`，可组合）；
+指针成员只显示地址不追踪，位域明确报暂不支持。符号被编译器优化掉或不存在时报错退出。
 
 ## 路线图
 
-- v2：✅ ELF 符号解析（变量名→地址，标量类型）；⏳ `watch` 周期采样 + 实时波形
+- v2：✅ ELF 符号解析（标量 / 数组 / 结构体 / 联合体 / 枚举，嵌套支持）；⏳ `watch` 周期采样 + 实时波形
 - v3：`chip.pack` 存在时自动调 target-gen 生成描述文件（幂等缓存）
 - v4：固件侧 RTT 通道，`watch` 数据源从「读内存」升级为 RTT（高带宽正道）
 - v5：GUI（egui）

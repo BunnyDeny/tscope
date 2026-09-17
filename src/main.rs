@@ -50,8 +50,16 @@ enum Cmd {
 
     /// 按符号名读取全局变量值（从 ELF 调试信息解析地址与类型）
     Var {
-        /// 符号名，如 theta_ref（当前支持 float/int/uint8_t 等标量）
+        /// 符号名或成员路径：theta_ref / ENC_1_POS_SENSOR.readAngleCmd / items[0].v.x
         symbol: String,
+
+        /// 数组最多显示的元素个数（默认 16）
+        #[arg(long, default_value_t = 16)]
+        count: usize,
+
+        /// 显示数组全部元素（覆盖 --count）
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -76,7 +84,11 @@ fn main() -> Result<()> {
             let mut session = session::open_session(&config.probe, &config.chip)?;
             read_words(&mut session, parse_hex(&address)?, count)
         }
-        Cmd::Var { symbol } => {
+        Cmd::Var {
+            symbol,
+            count,
+            all,
+        } => {
             let config = load_config(&cli.config)?;
             let elf = config
                 .firmware
@@ -84,7 +96,11 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf 路径，无法解析符号"))?;
             let mut session = session::open_session(&config.probe, &config.chip)?;
             let mut core = session.core(0)?;
-            symbol::print_global_value(&elf, &symbol, &mut core)
+            let opts = symbol::FmtOptions {
+                max_elems: if all { None } else { Some(count) },
+                max_depth: 3,
+            };
+            symbol::print_global_value(&elf, &symbol, &mut core, &opts)
         }
     }
 }
