@@ -53,9 +53,10 @@ chip.name → ① 内置 Registry 命中？──是→ 直接用
 ## 目录结构
 
 ```
-src/main.rs      CLI 入口：list / read 子命令
+src/main.rs      CLI 入口：list / read / var 子命令
 src/config.rs    YAML 配置结构、加载、校验、路径解析
 src/session.rs   四级 fallback 的会话建立 + 探针选择
+src/symbol.rs    符号解析：ELF+DWARF 查全局变量，按类型读值
 tscope.yaml      配置模板（GD32F503RE + J-Link 示例）
 ```
 
@@ -67,12 +68,16 @@ cargo build --release
 ./target/release/tscope list                       # 列探针，排查连接问题
 ./target/release/tscope read                       # 读 0x20000000 一个 32 位字
 ./target/release/tscope read --address 0x20000000 --count 4
+./target/release/tscope var theta_ref              # 按符号名读全局变量（float/int/uint8_t 等）
 ./target/release/tscope --config /path/to/tscope.yaml read
 ```
 
+`var` 子命令：从配置里 `firmware.elf` 的调试信息（DWARF）解析符号的地址与类型，
+经调试口读取后按类型打印；全程不暂停 CPU。符号被编译器优化掉或不存在时报错退出。
+
 ## 路线图
 
-- v2：ELF 符号解析（变量名→地址），`watch` 周期采样 + 实时波形（J-Scope 雏形）
+- v2：✅ ELF 符号解析（变量名→地址，标量类型）；⏳ `watch` 周期采样 + 实时波形
 - v3：`chip.pack` 存在时自动调 target-gen 生成描述文件（幂等缓存）
 - v4：固件侧 RTT 通道，`watch` 数据源从「读内存」升级为 RTT（高带宽正道）
 - v5：GUI（egui）

@@ -1,6 +1,7 @@
 //! tscope —— 基于 probe-rs 库的嵌入式调试 / 监视工具
 //!
 //! v1 功能：读取目标内存（默认 0x20000000）。
+//! v2 功能：按符号名解析 ELF 调试信息，读取全局变量值（`var` 子命令）。
 //! 架构按项目约定：
 //! - YAML 配置文件作为每次执行的"环境变量"（探针 / 芯片 / 固件信息）；
 //! - 芯片描述 YAML（target-gen 产物）与工具配置严格分开，配置只引用其路径；
@@ -9,6 +10,7 @@
 
 mod config;
 mod session;
+mod symbol;
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +47,12 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         count: usize,
     },
+
+    /// 按符号名读取全局变量值（从 ELF 调试信息解析地址与类型）
+    Var {
+        /// 符号名，如 theta_ref（当前支持 float/int/uint8_t 等标量）
+        symbol: String,
+    },
 }
 
 fn parse_hex(s: &str) -> Result<u64> {
@@ -67,6 +75,16 @@ fn main() -> Result<()> {
             let config = load_config(&cli.config)?;
             let mut session = session::open_session(&config.probe, &config.chip)?;
             read_words(&mut session, parse_hex(&address)?, count)
+        }
+        Cmd::Var { symbol } => {
+            let config = load_config(&cli.config)?;
+            let elf = config
+                .firmware
+                .elf
+                .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf 路径，无法解析符号"))?;
+            let mut session = session::open_session(&config.probe, &config.chip)?;
+            let mut core = session.core(0)?;
+            symbol::print_global_value(&elf, &symbol, &mut core)
         }
     }
 }

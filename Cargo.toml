@@ -12,6 +12,10 @@ clap = { version = "4", features = ["derive"] }
 # 相对路径从 tscope 仓库根出发：../probe-rs/probe-rs（两者是同级目录）。
 probe-rs = { path = "../probe-rs/probe-rs" }
 
+# 直接解析 ELF / DWARF 调试信息（symbol.rs 只查目标符号，避免官方机制的全量扫描）
+gimli = "0.34"
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+
 serde = { version = "1", features = ["derive"] }
 # serde_yaml 已停止维护；yaml_serde 是社区接班版本，probe-rs 自身也用它（0.10）
 yaml_serde = "0.10"
