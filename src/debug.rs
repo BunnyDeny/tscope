@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use probe_rs::{Core, Session};
 
+use crate::backtrace;
 use crate::config::ToolConfig;
 use crate::session;
 use crate::symbol;
@@ -78,9 +79,15 @@ pub fn run(config: &ToolConfig) -> Result<()> {
             "q" | "quit" | "exit" => break,
             "halt" => debug_halt(&mut session),
             "run" | "continue" | "c" => debug_run(&mut session, elf.as_deref(), &breakpoints),
-            "step" | "s" => debug_step(&mut session, elf.as_deref()),
+            "step" | "s" | "next" | "n" => debug_step(&mut session, elf.as_deref()),
+            "stepi" | "si" => debug_stepi(&mut session, elf.as_deref()),
+            "finish" | "fin" => debug_finish(&mut session, elf.as_deref()),
             "regs" => debug_regs(&mut session),
             "pc" => debug_pc(&mut session, elf.as_deref()),
+            "bt" | "backtrace" => {
+                let max = arg.and_then(|a| a.parse::<usize>().ok()).unwrap_or(20);
+                debug_bt(&mut session, elf.as_deref(), max)
+            }
             "list" | "l" => match arg {
                 Some(loc) => debug_list_at(elf.as_deref(), loc),
                 None => debug_list_current(&mut session, elf.as_deref()),
@@ -159,10 +166,14 @@ fn print_help() {
   bc <编号|all>      删除断点，如 bc 1 / bc all
   run                全速运行（continue / c 同义）；有断点时命中停下并报现场
   halt               暂停内核
-  step               单步执行一条指令（s 同义）
+  step               单步一行源码（s/next/n 同义）；函数末尾自动走出，
+                     中断函数末尾自动越过异常返回（回到被打断的代码）
+  stepi              单步一条机器指令（si 同义；-O2 下行号会跳）
+  finish             运行到当前函数返回（fin 同义；中断函数回到被打断处）
   reset [函数名]     复位并暂停在函数开头，默认 main（rst 同义）
   regs               导出全部内核寄存器
   pc                 打印 PC / SP / LR 及所在位置（文件:行号 + 函数）
+  bt [帧数]          打印函数调用栈（backtrace 同义；默认最多 20 帧）
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
   watch [组名]       持续显示监视组（不带参数列出所有组）；q 返回提示符
@@ -333,7 +344,126 @@ fn debug_bp_clear(
     Ok(())
 }
 
+fn read_pc(core: &mut probe_rs::Core) -> Result<u64> {
+    let pc: u32 = core
+        .read_core_reg(
+            core.registers()
+                .pc()
+                .context("找不到 PC 寄存器定义")?
+                .id(),
+        )
+        .context("读 PC 失败")?;
+    Ok(pc as u64)
+}
+
+/// 设断点全速运行到 addr（内核需已暂停）。命中返回 true；超时则停下返回 false。
+fn run_to_address(core: &mut probe_rs::Core, addr: u64) -> Result<bool> {
+    core.set_hw_breakpoint(addr)
+        .with_context(|| format!("设置临时断点 @ 0x{addr:08x} 失败"))?;
+    core.run().context("继续运行失败")?;
+    let hit = core.wait_for_core_halted(BP_WAIT_TIMEOUT).is_ok();
+    if !hit {
+        core.halt(HALT_TIMEOUT).context("暂停失败")?;
+    }
+    core.clear_hw_breakpoint(addr)
+        .with_context(|| format!("清除临时断点 @ 0x{addr:08x} 失败"))?;
+    Ok(hit)
+}
+
+/// 走出当前函数：普通函数断点停到返回地址；中断函数单步越过异常返回
+/// （走过 pop+bx lr 后自然落在被打断的代码，不读异常帧、不依赖 FPU）
+fn run_out_of_function(session: &mut Session, elf: &std::path::Path) -> Result<()> {
+    let mut core = session.core(0)?;
+    ensure_halted(&mut core, true)?;
+    let start_pc = read_pc(&mut core)?;
+    let start_func = symbol::function_name_at(elf, start_pc);
+
+    match backtrace::frame_return_address(elf, &mut core) {
+        Some(ra) if backtrace::is_exc_return(ra) => {
+            // 中断函数最外层：硬件单步越过尾声（pop + bx lr），
+            // 下一步自然停在被打断的代码（如 main 的 while 循环）
+            let mut escaped = false;
+            for _ in 0..64 {
+                core.step().context("单步失败")?;
+                let p = read_pc(&mut core)?;
+                if symbol::function_name_at(elf, p) != start_func {
+                    print_pc(p, Some(elf));
+                    escaped = true;
+                    break;
+                }
+            }
+            if !escaped {
+                println!("（单步 64 次仍未离开当前函数，可能仍在中断上下文中）");
+                print_pc(read_pc(&mut core)?, Some(elf));
+            }
+        }
+        Some(ra) => {
+            let addr = ra & !1;
+            if run_to_address(&mut core, addr)? {
+                print_pc(read_pc(&mut core)?, Some(elf));
+            } else {
+                println!("（未运行到返回地址，已暂停在当前处）");
+                print_pc(read_pc(&mut core)?, Some(elf));
+            }
+        }
+        None => {
+            // 无展开信息：退化为指令单步
+            let info = core.step().context("单步失败")?;
+            print_pc(info.pc as u64, Some(elf));
+        }
+    }
+    Ok(())
+}
+
 fn debug_step(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> {
+    let mut core = session.core(0)?;
+    ensure_halted(&mut core, true)?;
+    let start_pc = read_pc(&mut core)?;
+
+    // 无行号信息（汇编/库代码）：直接指令单步
+    let Some((start_file, start_line)) =
+        elf.and_then(|e| symbol::address_to_line(e, start_pc))
+    else {
+        let info = core.step().context("单步失败")?;
+        print_pc(info.pc as u64, elf);
+        return Ok(());
+    };
+
+    // 源码级单步（gdb 同款做法）：逐指令单步，直到
+    //   ① 源码行号变化（走到下一行）；
+    //   ② 离开当前函数（走出函数/中断返回）；
+    // 这样在互斥分支的状态机里也永远停在"真实执行过的行"，不会像
+    // 断点法那样等一个不执行的分支而超时。上限 200 条指令防长循环。
+    let start_func = elf.and_then(|e| symbol::function_name_at(e, start_pc));
+    for _ in 0..200 {
+        core.step().context("单步失败")?;
+        let p = read_pc(&mut core)?;
+
+        if elf.and_then(|e| symbol::function_name_at(e, p)) != start_func {
+            // 走出函数（含中断函数经异常返回落到被打断的代码）
+            print_pc(p, elf);
+            return Ok(());
+        }
+        if let Some((f, l)) = elf.and_then(|e| symbol::address_to_line(e, p)) {
+            if f != start_file || l != start_line {
+                print_pc(p, elf);
+                return Ok(());
+            }
+        }
+    }
+    println!("（单步 200 条指令仍未走到下一行，可能在长循环中）");
+    print_pc(read_pc(&mut core)?, elf);
+    Ok(())
+}
+
+/// finish：一步运行到当前函数返回（中断函数则运行到被打断的代码）
+fn debug_finish(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> {
+    let e = elf.ok_or_else(|| anyhow!("finish 需要 firmware.elf（展开信息）"))?;
+    run_out_of_function(session, e)
+}
+
+/// 指令级单步：一次执行一条机器指令（不管源码行）
+fn debug_stepi(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> {
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
     let info = core.step().context("单步失败")?;
@@ -441,6 +571,37 @@ fn debug_reset(
             "已自动恢复 {} 个断点（芯片复位会清空硬件断点，tscope 已重新写入，无需重新 bp）",
             breakpoints.len()
         );
+    }
+    Ok(())
+}
+
+/// bt：打印当前函数调用栈（#0 是最内层）
+fn debug_bt(
+    session: &mut Session,
+    elf: Option<&std::path::Path>,
+    max_frames: usize,
+) -> Result<()> {
+    let mut core = session.core(0)?;
+    ensure_halted(&mut core, true)?;
+    let elf = elf.ok_or_else(|| anyhow!("bt 需要 firmware.elf（.debug_frame 栈展开表）"))?;
+
+    let frames = crate::backtrace::backtrace(elf, &mut core, max_frames)?;
+
+    println!("调用栈（共 {} 帧，#0 为最内层）：", frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        let func = symbol::function_name_at(elf, f.pc);
+        let loc = symbol::address_to_line(elf, f.pc);
+        match (func, loc) {
+            (Some(fn_name), Some((file, line))) => {
+                println!("#{i:<3} {fn_name:<28} {file}:{line}  0x{:08x}", f.pc)
+            }
+            (Some(fn_name), None) => {
+                println!("#{i:<3} {fn_name:<28} （无行号信息）  0x{:08x}", f.pc)
+            }
+            (None, _) => {
+                println!("#{i:<3} <未知函数>                   0x{:08x}", f.pc)
+            }
+        }
     }
     Ok(())
 }

@@ -658,6 +658,63 @@ pub fn function_name_at(elf_path: &Path, addr: u64) -> Option<String> {
 // 行号表：file:line ↔ 地址
 // ===========================================================================
 
+/// 加载 ELF 的 DWARF 与 .debug_frame（栈回溯用），返回 (dwarf, debug_frame)
+pub(crate) fn load_debug_data(
+    elf_path: &Path,
+) -> Result<(
+    Dwarf<EndianRcSlice<RunTimeEndian>>,
+    gimli::read::DebugFrame<EndianRcSlice<RunTimeEndian>>,
+)> {
+    let data =
+        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let obj = object::File::parse(&*data).context("解析 ELF 失败（确认文件是 .elf）")?;
+
+    let endian = if obj.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+
+    let mut load_section =
+        |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
+            let bytes = obj
+                .section_by_name(id.name())
+                .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
+                .unwrap_or_default();
+            Ok(EndianRcSlice::new(
+                std::rc::Rc::from(bytes.as_slice()),
+                endian,
+            ))
+        };
+    let dwarf_sections =
+        gimli::DwarfSections::load(&mut load_section).context("加载 DWARF 调试信息失败")?;
+    let dwarf = dwarf_sections.borrow(|section| section.clone());
+
+    // .debug_frame：函数栈展开表（bt 命令用）
+    let frame_bytes = obj
+        .section_by_name(".debug_frame")
+        .and_then(|s| s.data().ok())
+        .map(|d| d.to_vec())
+        .unwrap_or_default();
+    let mut debug_frame = gimli::read::DebugFrame::from(EndianRcSlice::new(
+        std::rc::Rc::from(frame_bytes.as_slice()),
+        endian,
+    ));
+    // 关键：FDE 里的地址字段宽度必须与目标一致（32 位 ARM = 4 字节），
+    // 默认是宿主机字长 8，不设置会解析出乱码地址。
+    // 从 DWARF 第一个编译单元取地址宽度，取不到就按 4 处理。
+    let address_size = dwarf
+        .units()
+        .next()
+        .ok()
+        .flatten()
+        .map(|h| h.address_size())
+        .unwrap_or(4);
+    debug_frame.set_address_size(address_size);
+
+    Ok((dwarf, debug_frame))
+}
+
 /// 加载 ELF 的 DWARF 并执行闭包（行号表查询等一次性用途）
 fn with_dwarf<T>(
     elf_path: &Path,

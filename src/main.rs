@@ -8,6 +8,7 @@
 //! - 芯片是否官方支持由运行时查询内置 Registry 判定，四级 fallback 见 session.rs；
 //! - 库直接内嵌：本程序就是唯一进程，直接经 SWD 访问芯片，无中间服务。
 
+mod backtrace;
 mod config;
 mod debug;
 mod session;
