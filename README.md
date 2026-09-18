@@ -21,7 +21,12 @@ ENC_1_POS_SENSOR (positionStruct) = {
 ## 特性一览
 
 - `list`：列出本机调试探针（排查连接问题）
-- `read`：读取任意地址内存（32 位字 / 按字节）
+- `hexdump`：按字节转储任意地址内存（左列地址 + 中间十六进制 + 右列 ASCII）
+  - 任意地址起读，不要求对齐；内部按 32 位字批量读，效率与字读一致
+  - `--length`（字节数，十进制/0x 十六进制）、`--width` 每行字节数（4/8/16/32）、
+    `--group` 每组字节数（1/2/4/8，默认 4 字节一组 = 32 位字视觉；1 即 hexdump -C 同款）
+  - `--no-ascii` 隐藏 ASCII 列；`--collapse` 连续相同行折叠成 `*`（大段擦除区不刷屏）
+  - 旧名 `read` 保留为隐藏别名，`--count` 保留为 `--length` 的隐藏别名
 - `var`：按符号名读取全局变量，类型感知打印
   - 标量（float / int / uint8_t …）、数组（含多维）、结构体、联合体、枚举，任意嵌套
   - 成员路径：`ENC_1_POS_SENSOR.readAngleCmd`、`items[0].v.x`、`matrix[1][2]`
@@ -334,9 +339,13 @@ watch:
 # 探针自检
 tscope list
 
-# 读内存（默认 0x20000000，一个字）
-tscope read
-tscope read --address 0x08000000 --count 2      # bootloader 向量表
+# 转储内存（hexdump；默认 0x20000000 起 256 字节）
+tscope hexdump
+tscope hexdump --address 0x08000000 --length 64          # bootloader 向量表
+tscope hexdump --address 0x08004000 --length 0x200       # APP 头 512 字节（0x 十六进制）
+tscope hexdump --address 0x08000000 --width 8 --group 1  # hexdump -C 同款（逐字节）
+tscope hexdump --address 0x08000000 --length 0x400 --collapse   # 相同行折叠成 *
+tscope read --address 0x08000000 --length 32             # read 旧名照用
 
 # 按符号读变量（标量）
 tscope var theta_ref

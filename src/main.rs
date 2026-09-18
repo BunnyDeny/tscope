@@ -1,6 +1,6 @@
 //! tscope —— 基于 probe-rs 库的嵌入式调试 / 监视工具
 //!
-//! v1 功能：读取目标内存（默认 0x20000000）。
+//! v1 功能：hexdump 转储目标内存（地址列 + 十六进制列 + ASCII 列）。
 //! v2 功能：按符号名解析 ELF 调试信息，读取全局变量值（`var` 子命令）。
 //! 架构按项目约定：
 //! - YAML 配置文件作为每次执行的"环境变量"（探针 / 芯片 / 固件信息）；
@@ -12,6 +12,7 @@ mod backtrace;
 mod config;
 mod debug;
 mod flash;
+mod hexdump;
 mod session;
 mod symbol;
 mod watch;
@@ -20,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use probe_rs::MemoryInterface;
 
 use crate::config::ToolConfig;
 
@@ -41,15 +41,32 @@ enum Cmd {
     /// 列出所有调试探针（不需要配置文件）
     List,
 
-    /// 读取目标内存（32 位字）
-    Read {
+    /// 按字节转储目标内存：左列地址、中间十六进制值、右列 ASCII（read 为隐藏别名）
+    #[command(name = "hexdump", alias = "read")]
+    Hexdump {
         /// 起始地址，十六进制，默认 0x20000000（本芯片 RAM 起点）
         #[arg(long, default_value = "0x20000000")]
         address: String,
 
-        /// 读取的 32 位字数
-        #[arg(long, default_value_t = 1)]
-        count: usize,
+        /// 总字节数（十进制或 0x 十六进制，默认 256；count 为旧写法别名）
+        #[arg(long, default_value = "256", visible_alias = "count")]
+        length: String,
+
+        /// 每行字节数：4 / 8 / 16 / 32（默认 16）
+        #[arg(long, default_value_t = 16)]
+        width: usize,
+
+        /// 每组字节数：1 / 2 / 4 / 8（默认 4；1 即 hexdump -C 同款）
+        #[arg(long, default_value_t = 4)]
+        group: usize,
+
+        /// 隐藏最右 ASCII 列
+        #[arg(long)]
+        no_ascii: bool,
+
+        /// 连续相同行折叠成 *（大段 0xFF 擦除区不刷屏）
+        #[arg(long)]
+        collapse: bool,
     },
 
     /// 按符号名读取全局变量值（从 ELF 调试信息解析地址与类型）
@@ -95,6 +112,20 @@ fn parse_hex(s: &str) -> Result<u64> {
     u64::from_str_radix(t, 16).map_err(|e| anyhow::anyhow!("解析十六进制失败 {s}：{e}"))
 }
 
+/// 解析长度：纯十进制，或以 0x/0X 开头的十六进制
+fn parse_len(s: &str) -> Result<u64> {
+    let t = s.trim();
+    let n = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if hex.is_empty() {
+            bail!("无效的长度：{s}");
+        }
+        u64::from_str_radix(hex, 16)
+    } else {
+        t.parse::<u64>()
+    };
+    n.map_err(|e| anyhow::anyhow!("解析长度失败 {s}：{e}"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -103,10 +134,27 @@ fn main() -> Result<()> {
             session::list_probes();
             Ok(())
         }
-        Cmd::Read { address, count } => {
+        Cmd::Hexdump {
+            address,
+            length,
+            width,
+            group,
+            no_ascii,
+            collapse,
+        } => {
             let config = load_config(&cli.config)?;
             let mut session = session::open_session(&config.probe, &config.chip)?;
-            read_words(&mut session, parse_hex(&address)?, count)
+            hexdump::run(
+                &mut session,
+                &hexdump::DumpOptions {
+                    address: parse_hex(&address)?,
+                    length: parse_len(&length)?,
+                    width,
+                    group,
+                    show_ascii: !no_ascii,
+                    collapse,
+                },
+            )
         }
         Cmd::Var {
             symbol,
@@ -156,21 +204,4 @@ fn load_config(path: &Path) -> Result<ToolConfig> {
     let mut config = ToolConfig::load(&abs)?;
     config.absolutize(abs.parent().unwrap_or_else(|| Path::new(".")));
     Ok(config)
-}
-
-/// 读 count 个 32 位字并打印
-fn read_words(session: &mut probe_rs::Session, address: u64, count: usize) -> Result<()> {
-    if address % 4 != 0 {
-        bail!("地址 0x{address:08x} 不是 4 字节对齐（32 位读要求）");
-    }
-
-    let mut core = session.core(0)?;
-    let mut buf = vec![0u32; count];
-    core.read_32(address, &mut buf)
-        .with_context(|| format!("读取 0x{address:08x} 失败（芯片未上电？地址无效？）"))?;
-
-    for (i, v) in buf.iter().enumerate() {
-        println!("0x{:08x}: 0x{v:08x}", address + i as u64 * 4);
-    }
-    Ok(())
 }
