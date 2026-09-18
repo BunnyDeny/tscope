@@ -320,6 +320,12 @@ watch:
 
 运行 `tscope watch`（不带组名）可列出配置里定义的所有组。
 
+组名**完全任意**：`watch1` / `watch2` 只是示例，改成 `w1`、`a` 等任意名字
+（单个字母也行，`yes`/`no`/`on`/`off` 这类词同样可用，实测无任何格式限制）。
+改名后 `tscope watch w1` 打开；debug 会话里 `w w1` 打开（`w` 是 `watch` 的同义词）。
+个别严格的 YAML 1.1 工具会把 `yes` 之类当布尔值，若文件还要给别的工具读，
+建议加引号（`"yes":`）——tscope 本身不受影响。
+
 ---
 
 # 五、使用
@@ -365,12 +371,12 @@ tscope debug                    # 进入提示符 "> "，输入 help 查看命�
 > run                           # 全速运行，命中任断点停下并报 文件:行号+函数
 > halt                          # 暂停；regs 寄存器；pc 看 PC/SP/LR
 > s                             # 源码级单步（gdb 同款；-O2 下行号可能交错，-O0 最精确）
-> si                            # 指令级单步；finish 一步运行到当前函数返回
+> si                            # 指令级单步；finish 一步运行到当前函数返回（f / fin 同义）
 > bt                            # 函数调用栈回溯（backtrace 同义；bt 10 限制帧数）
 > list                          # 显示当前 PC 附近源码（l 同义；也可 l port.c:244）
 > reset                         # 复位并暂停在 main 开头（rst 同义；可指定函数）
 > var theta_ref                 # 一次性读全局变量
-> watch watch1                  # 全屏持续监视，q 返回提示符（会话不断）
+> watch watch1                  # 全屏持续监视，q 返回提示符（会话不断；w watch1 同义）
 > q                             # 退出会话
 ```
 

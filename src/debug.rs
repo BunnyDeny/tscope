@@ -7,7 +7,7 @@
 //!   并回到提示符（会话与探针连接保持不变）；
 //! - `bp` 的断点地址可写十六进制或函数名（从 firmware.elf 符号表解析，
 //!   自动清 Thumb 位）；命中断点后打印 PC 与所在函数，并自动清除断点；
-//! - halt/step/regs/pc 需要暂停内核，运行中会自动先暂停并提示；
+//! - halt/step/regs/pc 在运行时会自动先暂停内核并提示，暂停后保持（run 恢复）；
 //! - 所有操作只动 CPU 调试逻辑，不碰 flash（bootloader 安全）。
 
 use std::time::Duration;
@@ -33,7 +33,7 @@ pub fn run(config: &ToolConfig) -> Result<()> {
     let mut session = session::open_session(&config.probe, &config.chip)?;
 
     println!("tscope 调试会话已建立。输入 help 查看命令，q 退出。");
-    println!("提示：halt/step/regs/pc 需要暂停内核；bp 命中后内核保持暂停。");
+    println!("提示：halt/step/regs/pc 会自动暂停运行中的内核（暂停后保持，run 恢复运行）；bp 命中后内核保持暂停。");
     println!("行编辑：左右光标移动，↑/↓ 翻阅历史命令（跨会话保存）。");
 
     // readline 风格行编辑（rustyline）：光标移动、历史记录、Ctrl-A/E 等
@@ -81,7 +81,7 @@ pub fn run(config: &ToolConfig) -> Result<()> {
             "run" | "continue" | "c" => debug_run(&mut session, elf.as_deref(), &breakpoints),
             "step" | "s" | "next" | "n" => debug_step(&mut session, elf.as_deref()),
             "stepi" | "si" => debug_stepi(&mut session, elf.as_deref()),
-            "finish" | "fin" => debug_finish(&mut session, elf.as_deref()),
+            "finish" | "fin" | "f" => debug_finish(&mut session, elf.as_deref()),
             "regs" => debug_regs(&mut session),
             "pc" => debug_pc(&mut session, elf.as_deref()),
             "bt" | "backtrace" => {
@@ -128,7 +128,7 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                     symbol::print_global_value(elf, expr, &mut core, &opts)
                 })()
             }
-            "watch" => match arg {
+            "watch" | "w" => match arg {
                 Some(group) => watch::run_with_session(config, group, &mut session),
                 None => watch::list_groups(config),
             },
@@ -175,14 +175,14 @@ fn print_help() {
   step               单步一行源码（s/next/n 同义）；函数末尾自动走出，
                      中断函数末尾自动越过异常返回（回到被打断的代码）
   stepi              单步一条机器指令（si 同义；-O2 下行号会跳）
-  finish             运行到当前函数返回（fin 同义；中断函数回到被打断处）
+  finish             运行到当前函数返回（f / fin 同义；中断函数回到被打断处）
   reset [函数名]     复位并暂停在函数开头，默认 main（rst 同义）
   regs               导出全部内核寄存器
   pc                 打印 PC / SP / LR 及所在位置（文件:行号 + 函数）
   bt [帧数]          打印函数调用栈（backtrace 同义；默认最多 20 帧）
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
-  watch [组名]       持续显示监视组（不带参数列出所有组）；q 返回提示符
+  watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 
@@ -198,13 +198,14 @@ tscope 会自动恢复，无需重新 bp。"#
 // 各命令实现
 // ===========================================================================
 
-/// 运行中则先暂停（带提示），返回暂停后的内核
+/// 运行中则自动先暂停（暂停成功后才提示），返回暂停后的内核
 fn ensure_halted(core: &mut Core, verbose: bool) -> Result<()> {
     if !core.core_halted()? {
-        if verbose {
-            println!("（内核在运行，先暂停）");
-        }
         core.halt(HALT_TIMEOUT).context("暂停失败（超时？接线/供电？）")?;
+        if verbose {
+            // 提示放在暂停成功之后：描述「已发生的动作」，而不是指引用户去暂停
+            println!("（内核在运行，已自动暂停）");
+        }
     }
     Ok(())
 }
@@ -624,7 +625,7 @@ fn print_pc(pc: u64, elf: Option<&std::path::Path>) {
     }
 }
 
-/// list（不带参数）：显示当前 PC 附近源码。需要暂停内核 + firmware.elf。
+/// list（不带参数）：显示当前 PC 附近源码。需要 firmware.elf；内核在运行时会自动暂停。
 fn debug_list_current(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> {
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
