@@ -23,5 +23,8 @@ yaml_serde = "0.10"
 # TUI：watch 子命令的实时刷新表格（交替屏幕，退出自动恢复终端）
 ratatui = "0.30"
 
+# 进度条：flash 烧录的多阶段进度显示（probe-rs 官方 CLI 同款库）
+indicatif = "0.18"
+
 # 行编辑：debug 会话的左右光标、历史记录（↑/↓ 翻历史，跨会话持久化）
 rustyline = "15"

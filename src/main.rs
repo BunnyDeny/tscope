@@ -11,6 +11,7 @@
 mod backtrace;
 mod config;
 mod debug;
+mod flash;
 mod session;
 mod symbol;
 mod watch;
@@ -71,6 +72,17 @@ enum Cmd {
         group: Option<String>,
     },
 
+    /// 烧录 firmware.elf 到芯片（默认扇区擦除 + 校验，不复位）
+    Flash {
+        /// 整片擦除（⚠️ 会永久擦除 bootloader，需交互确认）
+        #[arg(long = "erase_all")]
+        erase_all: bool,
+
+        /// 跳过 --erase_all 的交互确认（危险，供自动化脚本使用）
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// 进入交互式调试会话（提示符 "> "，输入 help 查看命令）
     Debug,
 }
@@ -120,6 +132,10 @@ fn main() -> Result<()> {
                 Some(g) => watch::run(&config, &g),
                 None => watch::list_groups(&config),
             }
+        }
+        Cmd::Flash { erase_all, yes } => {
+            let config = load_config(&cli.config)?;
+            flash::run(&config, erase_all, yes)
         }
         Cmd::Debug => {
             let config = load_config(&cli.config)?;

@@ -94,33 +94,39 @@ pub fn run(config: &ToolConfig) -> Result<()> {
             },
             "reset" | "rst" => {
                 let target = arg.unwrap_or("main");
-                let elf = elf
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("reset 需要 firmware.elf 来解析函数地址（复位后暂停在函数开头）"))?;
-                debug_reset(&mut session, elf, target, &breakpoints)
+                // 注意：命令分支里的 ? 必须包在闭包里，否则会直接返回 run()
+                // 退出整个会话（主循环的错误捕获就失效了）
+                (|| -> Result<()> {
+                    let elf = elf
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("reset 需要 firmware.elf 来解析函数地址（复位后暂停在函数开头）"))?;
+                    debug_reset(&mut session, elf, target, &breakpoints)
+                })()
             }
-            "bp" => {
-                let target = arg.ok_or_else(|| anyhow!(
+            "bp" => match arg {
+                Some(target) => debug_bp_add(&mut session, elf.as_deref(), target, &mut breakpoints),
+                None => Err(anyhow!(
                     "用法：bp <地址|函数名|文件:行号>，如 bp main / bp 0x08004200 / bp foc.c:123"
-                ))?;
-                debug_bp_add(&mut session, elf.as_deref(), target, &mut breakpoints)
-            }
+                )),
+            },
             "bl" => debug_bp_list(&mut session, &breakpoints),
-            "bc" => {
-                let which = arg.ok_or_else(|| anyhow!("用法：bc <断点编号|all>，如 bc 1 / bc all"))?;
-                debug_bp_clear(&mut session, which, &mut breakpoints)
-            }
+            "bc" => match arg {
+                Some(which) => debug_bp_clear(&mut session, which, &mut breakpoints),
+                None => Err(anyhow!("用法：bc <断点编号|all>，如 bc 1 / bc all")),
+            },
             "var" => {
-                let expr = arg.ok_or_else(|| anyhow!("用法：var <表达式>，如 var theta_ref 或 var ENC_1_POS_SENSOR.readAngleCmd"))?;
-                let elf = elf
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("配置里没有 firmware.elf，无法解析符号"))?;
-                let mut core = session.core(0)?;
-                let opts = symbol::FmtOptions {
-                    max_elems: Some(16),
-                    max_depth: 3,
-                };
-                symbol::print_global_value(elf, expr, &mut core, &opts)
+                (|| -> Result<()> {
+                    let expr = arg.ok_or_else(|| anyhow!("用法：var <表达式>，如 var theta_ref 或 var ENC_1_POS_SENSOR.readAngleCmd"))?;
+                    let elf = elf
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，无法解析符号"))?;
+                    let mut core = session.core(0)?;
+                    let opts = symbol::FmtOptions {
+                        max_elems: Some(16),
+                        max_depth: 3,
+                    };
+                    symbol::print_global_value(elf, expr, &mut core, &opts)
+                })()
             }
             "watch" => match arg {
                 Some(group) => watch::run_with_session(config, group, &mut session),
@@ -217,7 +223,7 @@ fn debug_run(
 ) -> Result<()> {
     let mut core = session.core(0)?;
     if !core.core_halted()? {
-        println!("内核本来就在运行");
+        println!("内核正在运行（未暂停）。若需要从头启动固件，请用 rst（内部先复位并运行到 main）");
         return Ok(());
     }
 
