@@ -1,0 +1,1 @@
+1.hexdump,var支持watch那样的动态刷新，这样var与watch的区别就很小了，唯一的区别是watch可以同时监控多个变量，而var只能监控一个，但是换来的是不必编辑tscope.yaml文件监控组的灵活性
