@@ -82,15 +82,15 @@ enum Cmd {
         /// 符号名或成员路径：theta_ref / ENC_1_POS_SENSOR.readAngleCmd / items[0].v.x
         symbol: String,
 
-        /// 数组最多显示的元素个数（默认 16）
+        /// 数组最多显示的元素个数（默认 16；--watch 时即表格展开行数上限，等同 watch 组的 max_elems）
         #[arg(long, default_value_t = 16)]
         count: usize,
 
-        /// 显示数组全部元素（覆盖 --count）
+        /// 显示数组全部元素（覆盖 --count；--watch 时展开全部行）
         #[arg(long)]
         all: bool,
 
-        /// 持续刷新显示（watch 风格表格；q/Esc 退出）
+        /// 持续刷新显示（watch 风格表格；q/Esc 退出；展开上限由 --count / --all 控制）
         #[arg(long)]
         watch: bool,
 
