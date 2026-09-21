@@ -26,12 +26,16 @@ ENC_1_POS_SENSOR (positionStruct) = {
   - `--length`（字节数，十进制/0x 十六进制）、`--width` 每行字节数（4/8/16/32）、
     `--group` 每组字节数（1/2/4/8，默认 4 字节一组 = 32 位字视觉；1 即 hexdump -C 同款）
   - `--no-ascii` 隐藏 ASCII 列；`--collapse` 连续相同行折叠成 `*`（大段擦除区不刷屏）
+  - `--watch` 持续刷新（watch 风格交替屏，变化字节黄色高亮，↑↓/PgUp/PgDn/滚轮滚动，q/Esc 退出），
+    `--interval <ms>` 控制采样周期（默认 100）
   - 旧名 `read` 保留为隐藏别名，`--count` 保留为 `--length` 的隐藏别名
 - `var`：按符号名读取全局变量，类型感知打印
   - 标量（float / int / uint8_t …）、数组（含多维）、结构体、联合体、枚举，任意嵌套
   - 成员路径：`ENC_1_POS_SENSOR.readAngleCmd`、`items[0].v.x`、`matrix[1][2]`
   - 数组默认显示前 16 个元素，`--count N` / `--all` 控制
   - 指针成员只显示地址（`NULL` 显示 NULL），位域明确提示暂不支持
+  - `--watch` 持续刷新单符号（watch 风格表格，不必编辑 tscope.yaml 的监视组），
+    `--interval <ms>` 控制采样周期（默认 100）；复合类型展开上限复用 `--count` / `--all`
 - `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
   - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
   - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU

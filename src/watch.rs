@@ -20,7 +20,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use ratatui::DefaultTerminal;
 
-use crate::config::ToolConfig;
+use crate::config::{ToolConfig, WatchGroup};
 use crate::session;
 use crate::symbol::{prepare_symbol, PreparedSymbol, TypeDesc};
 
@@ -88,7 +88,33 @@ pub fn run_with_session(
         .elf
         .as_ref()
         .ok_or_else(|| anyhow!("配置里没有 firmware.elf，watch 无法解析符号"))?;
+    run_group(session, elf, &format!("watch [{group}]"), g)
+}
 
+/// 临时监视（var --watch 用）：不依赖配置文件里的监视组，就地组装一组
+pub fn run_adhoc(
+    session: &mut probe_rs::Session,
+    elf: &std::path::Path,
+    title: &str,
+    symbols: Vec<String>,
+    interval_ms: u64,
+    max_elems: usize,
+) -> Result<()> {
+    let g = WatchGroup {
+        interval_ms,
+        max_elems: max_elems.max(1),
+        symbols,
+    };
+    run_group(session, elf, title, &g)
+}
+
+/// 启动一组监视的 TUI（行构建 + 交替屏循环）
+fn run_group(
+    session: &mut probe_rs::Session,
+    elf: &std::path::Path,
+    title: &str,
+    g: &WatchGroup,
+) -> Result<()> {
     // 解析阶段（一次性）：单个符号解析失败只影响那一行，不中断整体。
     // 数组符号在此展开成元素行（封顶 max_elems）。
     let mut rows: Vec<WatchRow> = Vec::new();
@@ -149,7 +175,7 @@ pub fn run_with_session(
     // 用 try_init 而不是 init：无 TTY（管道/重定向）时返回错误而非 panic，
     // 保证 debug 会话里单条命令失败不炸掉整个会话。
     let mut terminal = ratatui::try_init()
-        .context("初始化终端失败（watch 需要真实终端，不能运行在管道/重定向下）")?;
+        .context("初始化终端失败（监视界面需要真实终端，不能运行在管道/重定向下）")?;
     // 开启鼠标捕获（滚轮滚动表格）
     let _ = std::io::stdout().execute(event::EnableMouseCapture);
     let mut state = TableState::default();
@@ -160,7 +186,7 @@ pub fn run_with_session(
         &mut terminal,
         session,
         &mut rows,
-        group,
+        title,
         g.interval_ms,
         &mut state,
     );
@@ -188,7 +214,7 @@ fn run_loop(
     terminal: &mut DefaultTerminal,
     session: &mut probe_rs::Session,
     rows: &mut [WatchRow],
-    group: &str,
+    title: &str,
     interval_ms: u64,
     state: &mut TableState,
 ) -> Result<()> {
@@ -312,8 +338,7 @@ fn run_loop(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(
-                        " tscope watch [{}] — 每 {} ms 采样，已运行 {} s — ↑↓/PgUp/PgDn/滚轮 滚动，q/Esc 退出 ",
-                        group,
+                        " tscope {title} — 每 {} ms 采样，已运行 {} s — ↑↓/PgUp/PgDn/滚轮 滚动，q/Esc 退出 ",
                         interval_ms,
                         started.elapsed().as_secs()
                     )),

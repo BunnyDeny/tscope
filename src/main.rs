@@ -67,6 +67,14 @@ enum Cmd {
         /// 连续相同行折叠成 *（大段 0xFF 擦除区不刷屏）
         #[arg(long)]
         collapse: bool,
+
+        /// 持续刷新显示（watch 风格交替屏，变化字节黄色高亮；q/Esc 退出）
+        #[arg(long)]
+        watch: bool,
+
+        /// 采样周期（毫秒，仅 --watch 生效，默认 100）
+        #[arg(long, default_value_t = 100)]
+        interval: u64,
     },
 
     /// 按符号名读取全局变量值（从 ELF 调试信息解析地址与类型）
@@ -81,6 +89,14 @@ enum Cmd {
         /// 显示数组全部元素（覆盖 --count）
         #[arg(long)]
         all: bool,
+
+        /// 持续刷新显示（watch 风格表格；q/Esc 退出）
+        #[arg(long)]
+        watch: bool,
+
+        /// 采样周期（毫秒，仅 --watch 生效，默认 100）
+        #[arg(long, default_value_t = 100)]
+        interval: u64,
     },
 
     /// 实时刷新监视组（Keil Watch 风格；组定义在 tscope.yaml 的 watch 节）
@@ -141,25 +157,31 @@ fn main() -> Result<()> {
             group,
             no_ascii,
             collapse,
+            watch,
+            interval,
         } => {
             let config = load_config(&cli.config)?;
             let mut session = session::open_session(&config.probe, &config.chip)?;
-            hexdump::run(
-                &mut session,
-                &hexdump::DumpOptions {
-                    address: parse_hex(&address)?,
-                    length: parse_len(&length)?,
-                    width,
-                    group,
-                    show_ascii: !no_ascii,
-                    collapse,
-                },
-            )
+            let opts = hexdump::DumpOptions {
+                address: parse_hex(&address)?,
+                length: parse_len(&length)?,
+                width,
+                group,
+                show_ascii: !no_ascii,
+                collapse,
+            };
+            if watch {
+                hexdump::run_watch(&mut session, &opts, interval)
+            } else {
+                hexdump::run(&mut session, &opts)
+            }
         }
         Cmd::Var {
             symbol,
             count,
             all,
+            watch,
+            interval,
         } => {
             let config = load_config(&cli.config)?;
             let elf = config
@@ -167,12 +189,24 @@ fn main() -> Result<()> {
                 .elf
                 .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf 路径，无法解析符号"))?;
             let mut session = session::open_session(&config.probe, &config.chip)?;
-            let mut core = session.core(0)?;
-            let opts = symbol::FmtOptions {
-                max_elems: if all { None } else { Some(count) },
-                max_depth: 3,
-            };
-            symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+            if watch {
+                // 临时监视组：不必编辑 tscope.yaml，max_elems 复用 --count/--all
+                watch::run_adhoc(
+                    &mut session,
+                    &elf,
+                    &format!("var --watch [{symbol}]"),
+                    vec![symbol.clone()],
+                    interval,
+                    if all { usize::MAX } else { count },
+                )
+            } else {
+                let mut core = session.core(0)?;
+                let opts = symbol::FmtOptions {
+                    max_elems: if all { None } else { Some(count) },
+                    max_depth: 3,
+                };
+                symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+            }
         }
         Cmd::Watch { group } => {
             let config = load_config(&cli.config)?;
