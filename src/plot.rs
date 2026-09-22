@@ -66,11 +66,7 @@ pub fn resolve_plot<'a>(config: &'a ToolConfig, name: &str) -> Result<&'a PlotCo
 /// 独立子命令入口：打开自己的探针，显示 yaml 配置的曲线
 pub fn run(config: &ToolConfig, name: &str) -> Result<()> {
     let cfg = resolve_plot(config, name)?;
-    let elf = config
-        .firmware
-        .elf
-        .as_ref()
-        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，plot 无法解析符号"))?;
+    let elf = config.firmware_image()?;
     let mut session = session::open_session(&config.probe, &config.chip)?;
     run_with_session(&mut session, cfg, elf, &format!("tscope plot [{name}]"))
 }

@@ -28,8 +28,11 @@ chip:
   pack: ../probe-rs/GDF503_target_gen/GD32F50x_AddOn_V1.0.1/GigaDevice.GD32F50x_DFP.1.0.1.pack
 
 firmware:
-  # var / watch 子命令从这里解析符号的地址与类型
+  # 固件镜像：var / watch / plot / flash 从这里解析符号与烧录。
+  # elf 与 axf 可同时配置：程序优先用「存在的」elf，回退 axf ——
+  # 同一份 yaml 在 Linux（GCC 的 .elf）与 Windows（Keil 的 .axf）通用
   elf: ../uni_software/bsp/gd/build/Project.elf
+  # axf: ../keil/Objects/project.axf   # Keil 产物路径（Windows 侧按实际填写）
 
 # ---------------------------------------------------------------------------
 # 实时监视组（tscope watch <组名>，Keil Watch 风格）

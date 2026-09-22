@@ -152,9 +152,14 @@ pub struct ChipConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirmwareConfig {
-    /// 固件 ELF：var / watch 子命令从这里解析符号的地址与类型
+    /// 固件镜像（GCC 产物 ELF；Linux 常用）：var / watch / plot 从这里解析符号
     #[serde(default)]
     pub elf: Option<PathBuf>,
+    /// Keil 产物 .axf（armclang/armcc 输出，本质也是 ELF + DWARF；
+    /// Windows/Keil 用户填这条）。与 elf 可同时配置：程序优先用**存在的** elf，
+    /// 回退到 axf——同一份 yaml 可跨 Linux / Windows 使用
+    #[serde(default)]
+    pub axf: Option<PathBuf>,
 }
 
 impl ToolConfig {
@@ -240,11 +245,103 @@ impl ToolConfig {
         if let Some(p) = &mut self.firmware.elf {
             absolutize_one(p, config_dir);
         }
+        if let Some(p) = &mut self.firmware.axf {
+            absolutize_one(p, config_dir);
+        }
+    }
+
+    /// 选择固件镜像文件：优先 `firmware.elf`（存在时），否则回退 `firmware.axf`。
+    /// 两者都是 ELF 格式（Keil 的 .axf 本质即 ELF+DWARF），解析不看扩展名。
+    /// 目的：同一份 tscope.yaml 在 Linux（GCC 产物）与 Windows（Keil 产物）
+    /// 两个平台通用——哪边产物存在就用哪边。
+    pub fn firmware_image(&self) -> Result<&Path> {
+        if let Some(p) = self.firmware.elf.as_deref() {
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        if let Some(p) = self.firmware.axf.as_deref() {
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        let show = |p: &Option<PathBuf>| match p {
+            Some(p) => format!(
+                "{}（{}）",
+                p.display(),
+                if p.exists() {
+                    "存在但不是文件"
+                } else {
+                    "不存在"
+                }
+            ),
+            None => "未配置".to_string(),
+        };
+        bail!(
+            "找不到固件镜像：firmware.elf 为 {}，firmware.axf 为 {}；请确认路径（Keil 的 .axf 也可直接填）",
+            show(&self.firmware.elf),
+            show(&self.firmware.axf)
+        )
     }
 }
 
 fn absolutize_one(p: &mut PathBuf, config_dir: &Path) {
     if p.is_relative() {
         *p = config_dir.join(&*p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firmware_image_prefers_elf_falls_back_to_axf() {
+        let dir = std::env::temp_dir().join(format!(
+            "tscope-cfg-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let elf = dir.join("f.elf");
+        let axf = dir.join("f.axf");
+        std::fs::write(&elf, b"x").unwrap();
+        std::fs::write(&axf, b"x").unwrap();
+
+        let base = || ToolConfig {
+            version: 1,
+            probe: Default::default(),
+            chip: ChipConfig {
+                name: "x".to_string(),
+                description: None,
+                pack: None,
+            },
+            firmware: FirmwareConfig {
+                elf: Some(elf.clone()),
+                axf: Some(axf.clone()),
+            },
+            watch: Default::default(),
+            plot: Default::default(),
+        };
+
+        // 两者都存在 → 优先 elf（保持既有行为）
+        let cfg = base();
+        assert_eq!(cfg.firmware_image().unwrap(), elf);
+
+        // elf 不存在、axf 存在 → 回退 axf（Windows/Keil 场景）
+        let mut cfg = base();
+        cfg.firmware.elf = Some(dir.join("missing.elf"));
+        assert_eq!(cfg.firmware_image().unwrap(), axf);
+
+        // 都不存在 → 报错
+        let mut cfg = base();
+        cfg.firmware.elf = Some(dir.join("missing.elf"));
+        cfg.firmware.axf = Some(dir.join("missing.axf"));
+        assert!(cfg.firmware_image().is_err());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

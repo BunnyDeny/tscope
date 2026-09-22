@@ -116,7 +116,7 @@ enum Cmd {
         name: Option<String>,
     },
 
-    /// 烧录 firmware.elf 到芯片（默认扇区擦除 + 校验，不复位）
+    /// 烧录固件镜像（firmware.elf / .axf）到芯片（默认扇区擦除 + 校验，不复位）
     Flash {
         /// 整片擦除（⚠️ 会永久擦除 bootloader，需交互确认）
         #[arg(long = "erase_all")]
@@ -199,16 +199,13 @@ fn main() -> Result<()> {
                 bail!("--plot 与 --watch 不能同时使用");
             }
             let config = load_config(&cli.config)?;
-            let elf = config
-                .firmware
-                .elf
-                .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf 路径，无法解析符号"))?;
+            let elf = config.firmware_image()?;
             if plot {
                 // 曲线模式：单符号 GUI 窗口（自己开探针；复合类型会明确报错）
                 plot::run_adhoc(
                     &config.probe,
                     &config.chip,
-                    &elf,
+                    elf,
                     &symbol,
                     interval,
                     &format!("var --plot [{symbol}]"),
@@ -219,7 +216,7 @@ fn main() -> Result<()> {
                     // 临时监视组：不必编辑 tscope.yaml，max_elems 复用 --count/--all
                     watch::run_adhoc(
                         &mut session,
-                        &elf,
+                        elf,
                         &format!("var --watch [{symbol}]"),
                         vec![symbol.clone()],
                         interval,
@@ -231,7 +228,7 @@ fn main() -> Result<()> {
                         max_elems: if all { None } else { Some(count) },
                         max_depth: 3,
                     };
-                    symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+                    symbol::print_global_value(elf, &symbol, &mut core, &opts)
                 }
             }
         }

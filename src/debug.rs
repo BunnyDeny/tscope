@@ -30,7 +30,7 @@ const BP_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 进入交互式调试会话
 pub fn run(config: &ToolConfig) -> Result<()> {
-    let elf = config.firmware.elf.clone();
+    let elf = config.firmware_image().ok().map(|p| p.to_path_buf());
     let mut session = session::open_session(&config.probe, &config.chip)?;
 
     println!("tscope 调试会话已建立。输入 help 查看命令，q 退出。");
@@ -99,7 +99,7 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 // 退出整个会话（主循环的错误捕获就失效了）
                 (|| -> Result<()> {
                     let elf = elf.as_deref().ok_or_else(|| {
-                        anyhow!("reset 需要 firmware.elf 来解析函数地址（复位后暂停在函数开头）")
+                        anyhow!("reset 需要固件镜像（firmware.elf / firmware.axf）来解析函数地址（复位后暂停在函数开头）")
                     })?;
                     debug_reset(&mut session, elf, target, &breakpoints)
                 })()
@@ -120,9 +120,11 @@ pub fn run(config: &ToolConfig) -> Result<()> {
             "var" => {
                 (|| -> Result<()> {
                     let expr = arg.ok_or_else(|| anyhow!("用法：var <表达式>，如 var theta_ref 或 var ENC_1_POS_SENSOR.readAngleCmd"))?;
-                    let elf = elf
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，无法解析符号"))?;
+                    let elf = elf.as_deref().ok_or_else(|| {
+                        anyhow!(
+                            "配置里没有可用的固件镜像（firmware.elf / firmware.axf），无法解析符号"
+                        )
+                    })?;
                     let mut core = session.core(0)?;
                     let opts = symbol::FmtOptions {
                         max_elems: Some(16),
@@ -144,11 +146,7 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                         return Ok(());
                     };
                     let cfg = plot::resolve_plot(config, name)?;
-                    let elf = config
-                        .firmware
-                        .elf
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，plot 无法解析符号"))?;
+                    let elf = config.firmware_image()?;
                     plot::run_with_session(&mut session, cfg, elf, &format!("debug plot [{name}]"))
                 })()
             }
@@ -490,7 +488,7 @@ fn debug_step(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()
 
 /// finish：一步运行到当前函数返回（中断函数则运行到被打断的代码）
 fn debug_finish(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> {
-    let e = elf.ok_or_else(|| anyhow!("finish 需要 firmware.elf（展开信息）"))?;
+    let e = elf.ok_or_else(|| anyhow!("finish 需要固件镜像（展开信息）"))?;
     run_out_of_function(session, e)
 }
 
@@ -601,7 +599,7 @@ fn debug_reset(
 fn debug_bt(session: &mut Session, elf: Option<&std::path::Path>, max_frames: usize) -> Result<()> {
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
-    let elf = elf.ok_or_else(|| anyhow!("bt 需要 firmware.elf（.debug_frame 栈展开表）"))?;
+    let elf = elf.ok_or_else(|| anyhow!("bt 需要固件镜像（.debug_frame 栈展开表）"))?;
 
     let frames = crate::backtrace::backtrace(elf, &mut core, max_frames)?;
 
@@ -644,7 +642,7 @@ fn debug_list_current(session: &mut Session, elf: Option<&std::path::Path>) -> R
         .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
         .context("读 PC 失败")?;
 
-    let elf = elf.ok_or_else(|| anyhow!("list 需要 firmware.elf 来反查当前源码位置"))?;
+    let elf = elf.ok_or_else(|| anyhow!("list 需要固件镜像来反查当前源码位置"))?;
     let (file, line) = symbol::address_to_line(elf, pc as u64)
         .ok_or_else(|| anyhow!("当前 PC 0x{pc:08x} 没有对应的源码行（汇编/库代码？）"))?;
     print_source_context(&file, line)
@@ -713,7 +711,7 @@ fn resolve_target(elf: Option<&std::path::Path>, s: &str) -> Result<u64> {
         if let Ok(line) = line_str.parse::<u64>() {
             if file.contains('/') || file.contains('\\') || file.contains('.') {
                 let elf =
-                    elf.ok_or_else(|| anyhow!("目标是源文件位置 {t}，但配置里没有 firmware.elf"))?;
+                    elf.ok_or_else(|| anyhow!("目标是源文件位置 {t}，但配置里没有固件镜像"))?;
                 return symbol::line_to_address(elf, file, line);
             }
         }

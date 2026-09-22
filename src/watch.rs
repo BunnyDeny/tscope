@@ -83,11 +83,7 @@ pub fn run_with_session(
             )
         }
     })?;
-    let elf = config
-        .firmware
-        .elf
-        .as_ref()
-        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，watch 无法解析符号"))?;
+    let elf = config.firmware_image()?;
     run_group(session, elf, &format!("watch [{group}]"), g)
 }
 

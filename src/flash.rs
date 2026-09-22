@@ -28,10 +28,8 @@ use crate::session;
 /// 烧录 firmware.elf。
 pub fn run(config: &ToolConfig, erase_all: bool, assume_yes: bool) -> Result<()> {
     let elf = config
-        .firmware
-        .elf
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf，无法烧录"))?;
+        .firmware_image()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if !elf.exists() {
         anyhow::bail!("固件文件不存在：{}", elf.display());
     }

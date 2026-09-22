@@ -306,9 +306,20 @@ target-gen pack GigaDevice.GD32F50x_DFP.1.0.1.pack ./targets/
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `elf` | `var` / `watch` 需要 | 固件 ELF 路径。从它的调试信息（DWARF）解析符号地址与类型 |
+| `elf` | 二选一 | 固件镜像路径（GCC 产物，Linux 常用）。从其调试信息（DWARF）解析符号地址与类型 |
+| `axf` | 二选一 | Keil 产物路径（armclang/armcc 输出，**本质也是 ELF**，Windows 侧常用） |
 
-**关键前提**：ELF 必须与**板上实际烧录的固件**是同一次构建的产物。
+两个字段**可同时配置**：程序优先用「存在的」`elf`，不存在则回退 `axf`——
+同一份 `tscope.yaml` 在 Linux（.elf）与 Windows（.axf）两个平台通用，
+哪边编译的产物存在就用哪边。两者都不存在时报错并列出两条路径。
+
+```yaml
+firmware:
+  elf: ../uni_software/bsp/gd/build/Project.elf   # Linux：GCC 产物
+  axf: ../keil/Objects/project.axf                # Windows：Keil 产物
+```
+
+**关键前提**：固件镜像必须与**板上实际烧录的固件**是同一次构建的产物。
 烧的是旧固件、指了新 ELF，符号地址会对不上，读出来的是别的数据。
 另外符号的可见性受编译优化影响：`-O2` 下部分变量会被优化掉，
 读不到时报错提示用 `-O0` 重新编译。
