@@ -121,7 +121,7 @@ sudo cp target/release/tscope /usr/local/bin/
 | 平台 | 说明 |
 |---|---|
 | Linux | 构建后还需配置 **udev 规则**（见下节），否则普通用户打不开探针 |
-| Windows | 构建过程相同（PowerShell 里跑同样的命令）；J-Link 需要 **WinUSB 驱动**（见下节） |
+| Windows | 构建过程相同（PowerShell 里跑同样的命令）；J-Link 需要 **WinUSB 驱动**（见下节）。**想从 Linux 交叉编译零依赖单文件 exe？见 [docs/windows-exe.md](docs/windows-exe.md)** |
 | macOS | probe-rs 对 J-Link 原生支持，无需额外配置（未实测） |
 
 ---
