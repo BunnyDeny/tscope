@@ -138,23 +138,62 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 None => watch::list_groups(config),
             },
             "plot" => {
-                // 曲线 GUI。Windows 实测教训：复用调试会话跑 plot（重复挂接 +
-                // 跨线程共享 Session）会让 J-Link 的 WinUSB 传输失步（bulk read
-                // timed out，且粘死到重开进程）。改法：释放旧会话 → plot 走
-                // 独立路径（自开全新会话，两个平台都验证正常）→ 结束后重开会话。
-                // 重开失败视为致命（本会话终止），plot 自身的错误则照常只打印不退出。
-                drop(session);
-                let r = match arg {
+                // 曲线 GUI。Windows 实测教训：J-Link 的 WinUSB 传输对
+                // 「复用会话 / 关会话后立刻重开」很脆弱（bulk read timed out
+                // 且粘死）。因此：先纯 CPU 准备（失败不碰探针）；再释放旧会话、
+                // 由 plot 打开全新会话；关窗后 plot 把会话**归还**给本会话，
+                // 成功路径上完全没有"重开"这一步。
+                let outcome: Result<()> = match arg {
                     None => plot::list_plots(config),
-                    Some(n) => plot::run(config, n),
+                    Some(name) => match plot::prepare_plot(config, name) {
+                        Err(e) => Err(e),
+                        Ok(prep) => {
+                            drop(session);
+                            // 带退避重试：plot 自开全新会话，成功则归还给本会话
+                            let mut new_session: Option<Session> = None;
+                            let mut plot_err: Option<anyhow::Error> = None;
+                            for attempt in 1..=3u32 {
+                                match plot::run_prepared_owned(
+                                    &config.probe,
+                                    &config.chip,
+                                    &prep,
+                                    &format!("debug plot [{name}]"),
+                                ) {
+                                    Ok(s) => {
+                                        new_session = Some(s);
+                                        break;
+                                    }
+                                    Err(e) if attempt < 3 => {
+                                        eprintln!("plot 启动失败（第 {attempt}/3 次）：{e:#}，稍后重试…");
+                                        plot_err = Some(e);
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            400 * u64::from(attempt),
+                                        ));
+                                    }
+                                    Err(e) => plot_err = Some(e),
+                                }
+                            }
+                            if let Some(s) = new_session {
+                                session = s;
+                                Ok(())
+                            } else {
+                                // plot 没起来：尽力重开会话保住 REPL；
+                                // 重开也失败则本会话终止（无法继续）
+                                session =
+                                    match session::open_session(&config.probe, &config.chip) {
+                                        Ok(s) => s,
+                                        Err(e2) => {
+                                            return Err(e2.context(
+                                                "plot 启动失败且探针重连失败，本会话终止",
+                                            ));
+                                        }
+                                    };
+                                Err(plot_err.unwrap_or_else(|| anyhow!("plot 启动失败")))
+                            }
+                        }
+                    },
                 };
-                session = match session::open_session(&config.probe, &config.chip) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Err(e.context("plot 后重开调试会话失败（探针重连不上），本会话终止"));
-                    }
-                };
-                r
+                outcome
             }
             other => {
                 println!("未知命令 {other}（help 查看命令列表）");

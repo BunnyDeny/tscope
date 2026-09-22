@@ -6,14 +6,18 @@
 //! 三个入口：
 //! - [`run`]：独立子命令，自己打开探针；
 //! - [`run_adhoc`]：`var --plot` 的单符号临时曲线，自己打开探针；
-//! - [`run_with_session`]：给定会话启动曲线（run / run_adhoc 内部使用；
-//!   Windows 实测教训——debug 会话不能复用它，重复挂接会让 J-Link 的
-//!   WinUSB 传输失步，debug 里的 plot 改走 run() 独立路径）。
+//! - [`run_prepared_owned`]：debug 会话里的 `plot` 命令——由 debug 侧先
+//!   [`prepare_plot`]（纯 CPU）再调用；它打开**全新**会话跑 GUI，关窗后
+//!   把会话**归还**给 debug，全程不存在"关闭后立刻重开"的脆弱交接。
 //!
 //! 架构：采样线程独占 probe-rs Session（Session 非 Sync），按周期读符号
 //! 数值经 mpsc 送出；UI 侧用 tscope_plot::ChannelSource 包装，PlotApp 只认
 //! 「通道名 + (时刻, 数值) 流」——UI 层与硬件完全解耦。
-//! 复用会话时采样线程经 std::thread::scope 借用 &mut Session。
+//!
+//! Windows 实测教训（重要）：J-Link 的 WinUSB 传输在「同一会话重复挂接 /
+//! 关会话后立即重开会话」时容易 bulk read 失步且粘死。因此：
+//! - 会话只挂接一次（预检）＋采样线程借用，全部走**全新打开的会话**；
+//! - debug 复用旧会话的写法已废弃（见 commit e7b817f）。
 //!
 //! 同一符号可出现在多个图组：只采样一次（去重），按通道顺序复用数值。
 
@@ -28,6 +32,21 @@ use tscope_plot::{run_app, ChannelSource, PlotApp, PlotOptions, Sample};
 use crate::config::{ChipConfig, PlotConfig, ProbeConfig, ToolConfig};
 use crate::session;
 use crate::symbol::{prepare_symbol, PreparedSymbol};
+
+/// 一次曲线会话的完整准备（纯 CPU，不碰探针）：
+/// 展平符号、图组边界、解析并校验标量、通道映射。
+pub struct PreparedPlot {
+    pub window_secs: f64,
+    pub interval_ms: u64,
+    /// 通道顺序（每个符号出现位置一个通道）
+    pub ordered: Vec<String>,
+    /// 图组划分（通道索引）
+    pub groups_idx: Vec<Vec<usize>>,
+    /// 去重后的符号解析结果
+    pub prepared: Vec<PreparedSymbol>,
+    /// 通道顺序 → prepared 下标
+    pub chan_of: Vec<usize>,
+}
 
 /// 列出配置里定义的所有曲线配置（`tscope plot` 不带参数时）
 pub fn list_plots(config: &ToolConfig) -> Result<()> {
@@ -49,7 +68,7 @@ pub fn list_plots(config: &ToolConfig) -> Result<()> {
     Ok(())
 }
 
-/// 查找 yaml 里的曲线配置（run / debug 的 plot 命令共用）
+/// 查找 yaml 里的曲线配置
 pub fn resolve_plot<'a>(config: &'a ToolConfig, name: &str) -> Result<&'a PlotConfig> {
     config.plot.get(name).ok_or_else(|| {
         let names: Vec<String> = config.plot.keys().cloned().collect();
@@ -64,43 +83,17 @@ pub fn resolve_plot<'a>(config: &'a ToolConfig, name: &str) -> Result<&'a PlotCo
     })
 }
 
-/// 独立子命令入口：打开自己的探针，显示 yaml 配置的曲线
-pub fn run(config: &ToolConfig, name: &str) -> Result<()> {
+/// 纯 CPU 准备：解析 yaml 配置 + 全部符号（不碰探针）。
+/// debug 的 plot 命令第一步调用它——任何配置/符号错误在此拦下，
+/// 调试会话与探针不受影响。
+pub fn prepare_plot(config: &ToolConfig, name: &str) -> Result<PreparedPlot> {
     let cfg = resolve_plot(config, name)?;
     let elf = config.firmware_image()?;
-    let mut session = session::open_session(&config.probe, &config.chip)?;
-    run_with_session(&mut session, cfg, elf, &format!("tscope plot [{name}]"))
+    prepare_groups(cfg, elf)
 }
 
-/// `var --plot`：单符号临时曲线（不依赖 yaml plot 节），自己打开探针。
-/// 传入复合类型会明确报错（标量检测）。
-pub fn run_adhoc(
-    probe: &ProbeConfig,
-    chip: &ChipConfig,
-    elf: &Path,
-    symbol: &str,
-    interval_ms: u64,
-    title: &str,
-) -> Result<()> {
-    let cfg = PlotConfig {
-        interval_ms,
-        window_secs: 5.0,
-        groups: vec![vec![symbol.to_string()]],
-    };
-    let mut session = session::open_session(probe, chip)?;
-    run_with_session(&mut session, &cfg, elf, title)
-}
-
-/// 在给定会话上启动曲线 GUI（run / run_adhoc 内部使用：先开自己的
-/// 全新会话再传入）。GUI 期间调用方阻塞；窗口关闭后 scope 结束、
-/// 采样线程退出，会话完好。**不要**在 debug 会话里复用（Windows 上
-/// J-Link 会 bulk read 失步），debug 的 plot 走 run() 独立路径。
-pub fn run_with_session(
-    session: &mut Session,
-    cfg: &PlotConfig,
-    elf: &Path,
-    title: &str,
-) -> Result<()> {
+/// 纯 CPU 准备（给定 PlotConfig 与固件镜像）
+fn prepare_groups(cfg: &PlotConfig, elf: &Path) -> Result<PreparedPlot> {
     // —— 展平符号：每个出现位置 = 一个通道；记录图组边界；去重采样 ——
     let mut ordered: Vec<String> = Vec::new();
     let mut groups_idx: Vec<Vec<usize>> = Vec::new();
@@ -135,18 +128,70 @@ pub fn run_with_session(
         .map(|s| unique.iter().position(|u| u == s).unwrap())
         .collect();
 
-    // —— 预检：attach 失败立即报错退出，不弹空窗口（采样线程内部会重新 attach） ——
+    Ok(PreparedPlot {
+        window_secs: cfg.window_secs,
+        interval_ms: cfg.interval_ms,
+        ordered,
+        groups_idx,
+        prepared,
+        chan_of,
+    })
+}
+
+/// 独立子命令入口：打开自己的探针，显示 yaml 配置的曲线
+pub fn run(config: &ToolConfig, name: &str) -> Result<()> {
+    let prep = prepare_plot(config, name)?;
+    let _ = run_prepared_owned(
+        &config.probe,
+        &config.chip,
+        &prep,
+        &format!("tscope plot [{name}]"),
+    )?;
+    Ok(())
+}
+
+/// `var --plot`：单符号临时曲线（不依赖 yaml plot 节），自己打开探针。
+/// 传入复合类型会明确报错（标量检测）。
+pub fn run_adhoc(
+    probe: &ProbeConfig,
+    chip: &ChipConfig,
+    elf: &Path,
+    symbol: &str,
+    interval_ms: u64,
+    title: &str,
+) -> Result<()> {
+    let cfg = PlotConfig {
+        interval_ms,
+        window_secs: 5.0,
+        groups: vec![vec![symbol.to_string()]],
+    };
+    let prep = prepare_groups(&cfg, elf)?;
+    let _ = run_prepared_owned(probe, chip, &prep, title)?;
+    Ok(())
+}
+
+/// debug 的 plot 命令用：打开**全新**探针会话跑 GUI，关窗后把会话
+/// **归还**给调用方（避免"关闭后立刻重开"的脆弱交接——那是 Windows
+/// 上 bulk read 失步的高发场景）。
+pub fn run_prepared_owned(
+    probe: &ProbeConfig,
+    chip: &ChipConfig,
+    prep: &PreparedPlot,
+    title: &str,
+) -> Result<Session> {
+    let mut session = session::open_session(probe, chip)?;
+    // 预检：attach 失败立即报错退出，不弹空窗口（采样线程内部会重新 attach）
     session.core(0).context("attach 内核失败")?;
-    let interval = Duration::from_millis(cfg.interval_ms.max(10));
+    let interval = Duration::from_millis(prep.interval_ms.max(10));
     let (tx, rx) = mpsc::channel::<Sample>();
 
     // —— UI ——
-    let source = ChannelSource::new(rx, ordered);
+    let source = ChannelSource::new(rx, prep.ordered.clone());
     let app = PlotApp::new(
         Box::new(source),
         PlotOptions {
-            window_secs: cfg.window_secs,
-            groups: groups_idx,
+            window_secs: prep.window_secs,
+            groups: prep.groups_idx.clone(),
             ..Default::default()
         },
     )
@@ -154,9 +199,12 @@ pub fn run_with_session(
 
     // —— 采样线程（借用会话）+ GUI 主循环（阻塞当前线程） ——
     std::thread::scope(|s| -> Result<()> {
-        s.spawn(move || sampler_loop(session, &prepared, &chan_of, interval, tx));
+        // 显式重借用：move 闭包只搬走 &mut 引用，Session 本体留在这里
+        let session_ref = &mut session;
+        s.spawn(move || sampler_loop(session_ref, &prep.prepared, &prep.chan_of, interval, tx));
         run_app(app, title).map_err(|e| anyhow!("GUI 运行失败：{e}"))
-    })
+    })?;
+    Ok(session)
 }
 
 /// 采样循环：独占（借用）Session，按固定节拍读符号 → mpsc。
