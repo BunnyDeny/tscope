@@ -138,62 +138,20 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 None => watch::list_groups(config),
             },
             "plot" => {
-                // 曲线 GUI。Windows 实测教训：J-Link 的 WinUSB 传输对
-                // 「复用会话 / 关会话后立刻重开」很脆弱（bulk read timed out
-                // 且粘死）。因此：先纯 CPU 准备（失败不碰探针）；再释放旧会话、
-                // 由 plot 打开全新会话；关窗后 plot 把会话**归还**给本会话，
-                // 成功路径上完全没有"重开"这一步。
-                let outcome: Result<()> = match arg {
+                // 曲线 GUI：直接借用本会话（debug 能进来说明探针本来就通，
+                // 没必要开关一次——开关交接正是 Windows 上超时高发点）。
+                // 先纯 CPU 准备（失败不碰探针），采样线程只挂接一次，零交接。
+                match arg {
                     None => plot::list_plots(config),
                     Some(name) => match plot::prepare_plot(config, name) {
                         Err(e) => Err(e),
-                        Ok(prep) => {
-                            drop(session);
-                            // 带退避重试：plot 自开全新会话，成功则归还给本会话
-                            let mut new_session: Option<Session> = None;
-                            let mut plot_err: Option<anyhow::Error> = None;
-                            for attempt in 1..=3u32 {
-                                match plot::run_prepared_owned(
-                                    &config.probe,
-                                    &config.chip,
-                                    &prep,
-                                    &format!("debug plot [{name}]"),
-                                ) {
-                                    Ok(s) => {
-                                        new_session = Some(s);
-                                        break;
-                                    }
-                                    Err(e) if attempt < 3 => {
-                                        eprintln!("plot 启动失败（第 {attempt}/3 次）：{e:#}，稍后重试…");
-                                        plot_err = Some(e);
-                                        std::thread::sleep(std::time::Duration::from_millis(
-                                            400 * u64::from(attempt),
-                                        ));
-                                    }
-                                    Err(e) => plot_err = Some(e),
-                                }
-                            }
-                            if let Some(s) = new_session {
-                                session = s;
-                                Ok(())
-                            } else {
-                                // plot 没起来：尽力重开会话保住 REPL；
-                                // 重开也失败则本会话终止（无法继续）
-                                session =
-                                    match session::open_session(&config.probe, &config.chip) {
-                                        Ok(s) => s,
-                                        Err(e2) => {
-                                            return Err(e2.context(
-                                                "plot 启动失败且探针重连失败，本会话终止",
-                                            ));
-                                        }
-                                    };
-                                Err(plot_err.unwrap_or_else(|| anyhow!("plot 启动失败")))
-                            }
-                        }
+                        Ok(prep) => plot::run_reused(
+                            &mut session,
+                            &prep,
+                            &format!("debug plot [{name}]"),
+                        ),
                     },
-                };
-                outcome
+                }
             }
             other => {
                 println!("未知命令 {other}（help 查看命令列表）");
@@ -246,8 +204,8 @@ fn print_help() {
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
   watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
-  plot [配置名]      GUI 窗口显示曲线（执行时探针短暂重连；不带参数
-                      列出所有配置）；关窗后返回提示符
+  plot [配置名]      GUI 窗口显示曲线（复用本会话；不带参数列出所有配置）；
+                      关窗后返回提示符
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 

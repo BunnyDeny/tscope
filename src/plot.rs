@@ -14,10 +14,13 @@
 //! 数值经 mpsc 送出；UI 侧用 tscope_plot::ChannelSource 包装，PlotApp 只认
 //! 「通道名 + (时刻, 数值) 流」——UI 层与硬件完全解耦。
 //!
-//! Windows 实测教训（重要）：J-Link 的 WinUSB 传输在「同一会话重复挂接 /
-//! 关会话后立即重开会话」时容易 bulk read 失步且粘死。因此：
-//! - 会话只挂接一次（预检）＋采样线程借用，全部走**全新打开的会话**；
-//! - debug 复用旧会话的写法已废弃（见 commit e7b817f）。
+//! Windows 实测教训（重要）：J-Link 的 WinUSB 传输对「同一会话上重复挂接 /
+//! 关会话后立即重开会话」都很脆弱（bulk read 失步且粘死）。因此挂接次数
+//! 压到最低：
+//! - debug 里的 plot：**直接借用** debug 会话，不做预检、采样线程只挂接
+//!   一次（run_reused），全程零交接；
+//! - 独立路径（run / run_adhoc）：全新会话 + 一次预检挂接
+//!   （run_prepared_owned），两个平台验证正常。
 //!
 //! 同一符号可出现在多个图组：只采样一次（去重），按通道顺序复用数值。
 
@@ -170,9 +173,39 @@ pub fn run_adhoc(
     Ok(())
 }
 
-/// debug 的 plot 命令用：打开**全新**探针会话跑 GUI，关窗后把会话
-/// **归还**给调用方（避免"关闭后立刻重开"的脆弱交接——那是 Windows
-/// 上 bulk read 失步的高发场景）。
+/// debug 的 plot 命令用：**直接借用** debug 已打开的会话（用户直觉正确：
+/// debug 能进来说明探针本来就通，没必要再开关一次）。与独立路径的区别：
+/// 不做预检挂接（历史教训——在"用过多次的会话"上额外挂接是 Windows 下
+/// 超时高发点），采样线程只挂接一次；GUI 期间 REPL 阻塞，关窗后会话
+/// 原地归还，全程零交接。
+pub fn run_reused(session: &mut Session, prep: &PreparedPlot, title: &str) -> Result<()> {
+    let interval = Duration::from_millis(prep.interval_ms.max(10));
+    let (tx, rx) = mpsc::channel::<Sample>();
+
+    // —— UI ——
+    let source = ChannelSource::new(rx, prep.ordered.clone());
+    let app = PlotApp::new(
+        Box::new(source),
+        PlotOptions {
+            window_secs: prep.window_secs,
+            groups: prep.groups_idx.clone(),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| anyhow!("曲线配置错误：{e}"))?;
+
+    // —— 采样线程（借用会话，只挂接一次）+ GUI 主循环（阻塞当前线程） ——
+    std::thread::scope(|s| -> Result<()> {
+        // 显式重借用：move 闭包只搬走 &mut 引用，Session 本体留在调用方
+        let session_ref = &mut *session;
+        s.spawn(move || sampler_loop(session_ref, &prep.prepared, &prep.chan_of, interval, tx));
+        run_app(app, title).map_err(|e| anyhow!("GUI 运行失败：{e}"))
+    })
+}
+
+/// 独立路径用：打开**全新**探针会话跑 GUI（run / run_adhoc 内部调用）。
+/// 与 run_reused 的区别：这里做一次预检挂接（全新会话上安全），
+/// 采样线程再挂接一次。
 pub fn run_prepared_owned(
     probe: &ProbeConfig,
     chip: &ChipConfig,
