@@ -251,23 +251,22 @@ fn sampler_loop(
 ) {
     // 挂接带退避重试：Windows 上 J-Link 的 USB 传输偶发超时
     // （环境问题，与工具逻辑无关），重试可显著提高成功率
-    let mut core_opt = None;
-    for attempt in 1..=5u32 {
+    let mut attempt: u32 = 0;
+    let core = 'attach: loop {
+        attempt += 1;
         match session.core(0) {
-            Ok(c) => {
-                core_opt = Some(c);
-                break;
-            }
+            Ok(c) => break 'attach Some(c),
             Err(e) if attempt < 5 => {
                 eprintln!("采样线程挂接失败（第 {attempt}/5 次）：{e:#}，重试中…");
                 std::thread::sleep(Duration::from_millis(300 * u64::from(attempt)));
             }
             Err(e) => {
                 eprintln!("采样线程挂接失败（第 5/5 次）：{e:#}，放弃采样（曲线窗口将无数据）");
+                break 'attach None;
             }
         }
-    }
-    let Some(mut core) = core_opt else {
+    };
+    let Some(mut core) = core else {
         return;
     };
     let start = Instant::now();
