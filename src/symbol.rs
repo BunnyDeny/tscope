@@ -941,6 +941,10 @@ pub fn line_to_address(elf_path: &Path, wanted: &str, line: u64) -> Result<u64> 
             let paths = build_file_paths(dwarf, &unit, program.header());
             let mut rows = program.rows();
             while let Some((_, row)) = rows.next_row().context("遍历行号表失败")? {
+                // 序列结束行会残留上一行的行号（Keil 实测），不可信
+                if row.end_sequence() {
+                    continue;
+                }
                 if row.line().map(std::num::NonZeroU64::get) != Some(line) {
                     continue;
                 }
@@ -987,11 +991,50 @@ pub fn line_to_address(elf_path: &Path, wanted: &str, line: u64) -> Result<u64> 
     Ok(files[0].1)
 }
 
+/// 从"行事件流"中挑出包含 addr 的行（纯逻辑，独立出来便于单元测试）。
+/// 每个事件 =（行地址, 行号, 是否序列结束, 附带的文件路径标签）。
+/// 行区间 = [本行地址, 下一行地址)，序列结束时区间到 end 行地址为止。
+/// 处理 Keil/armclang 行号表的两个实测怪癖：
+/// 1. 序列不按地址排序（同一单元内地址会跳变）——必须全量遍历；
+/// 2. end_sequence 行会**残留上一行的行号**——end 行自身不算一行；
+/// 3. 行号为 None（行号 0）的行不开启新区间，上一行区间延续。
+fn pick_line_row<T: Clone>(
+    events: &[(u64, Option<u64>, bool, T)],
+    addr: u64,
+) -> Option<(u64, u64, T)> {
+    let mut cur: Option<(u64, u64, T)> = None;
+    let mut best: Option<(u64, u64, T)> = None;
+    for (row_addr, line, is_end, tag) in events {
+        // 前一行区间 [start, row_addr) 在此闭合
+        if let Some((start, ln, t)) = &cur {
+            if addr >= *start
+                && addr < *row_addr
+                && best.as_ref().is_none_or(|(bs, _, _)| *start >= *bs)
+            {
+                best = Some((*start, *ln, t.clone()));
+            }
+        }
+        if *is_end {
+            cur = None;
+        } else if let Some(ln) = line {
+            cur = Some((*row_addr, *ln, tag.clone()));
+        }
+        // 行号 None 且非 end：不开启新区间，上一行区间延续
+    }
+    // 程序尾部的行（无 end_sequence 收尾的序列）
+    if let Some((start, ln, t)) = cur {
+        if addr >= start && best.as_ref().is_none_or(|(bs, _, _)| start >= *bs) {
+            best = Some((start, ln, t));
+        }
+    }
+    best
+}
+
 /// 行号表反查：地址 → (文件, 行号)。断点命中/暂停时展示用。
 pub fn address_to_line(elf_path: &Path, addr: u64) -> Option<(String, u64)> {
     let addr = addr & !1;
-    // (地址, 文件, 行号)，取地址 ≤ addr 的最近一行
-    let mut best: Option<(u64, String, u64)> = None;
+    // 各单元候选（行起始地址, 行号, 路径），取起始地址最大者（距 addr 最近）
+    let mut best: Option<(u64, u64, String)> = None;
 
     let _ = with_dwarf(elf_path, |dwarf| {
         let mut units = dwarf.units();
@@ -1001,30 +1044,31 @@ pub fn address_to_line(elf_path: &Path, addr: u64) -> Option<(String, u64)> {
                 continue;
             };
             let paths = build_file_paths(dwarf, &unit, program.header());
+            // 全量收集该单元的行事件（序列乱序，不能提前退出）
+            let mut events: Vec<(u64, Option<u64>, bool, String)> = Vec::new();
             let mut rows = program.rows();
             while let Some((_, row)) = rows.next_row()? {
-                let row_addr = row.address();
-                if row_addr > addr {
-                    break; // 行号表按地址递增，可提前退出
-                }
-                let Some(line) = row.line() else { continue };
                 let path = paths
                     .get(row.file_index() as usize)
                     .cloned()
                     .unwrap_or_default();
-                if path.is_empty() {
-                    continue;
-                }
-                if best.as_ref().is_none_or(|(ba, _, _)| row_addr >= *ba) {
-                    best = Some((row_addr, path, line.get()));
+                events.push((
+                    row.address(),
+                    row.line().map(std::num::NonZeroU64::get),
+                    row.end_sequence(),
+                    path,
+                ));
+            }
+            if let Some((start, line, path)) = pick_line_row(&events, addr) {
+                if !path.is_empty() && best.as_ref().is_none_or(|(bs, _, _)| start >= *bs) {
+                    best = Some((start, line, path));
                 }
             }
         }
         Ok(())
     });
 
-    best.filter(|(_, p, _)| !p.is_empty())
-        .map(|(_, p, l)| (p, l))
+    best.map(|(_, l, p)| (p, l))
 }
 
 /// 提取静态变量的地址：DW_AT_location 通常是常量地址（DW_OP_addr）
@@ -1684,6 +1728,42 @@ fn render(buf: &[u8], ty: &TypeDesc, opts: &FmtOptions, depth: usize) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_line_row_handles_keil_quirks() {
+        // 真实 Keil axf 实测模式：序列乱序 + end 行残留上一行行号
+        let events: Vec<(u64, Option<u64>, bool, &str)> = vec![
+            (0x0800991a, Some(1105), false, "fmc"), // fmc:1105 区间开始
+            (0x08009928, Some(1105), true, "fmc"),  // 序列结束（行号残留 1105）
+            (0x08009928, Some(777), false, "foc"),  // foc:777 区间开始
+            (0x0800992c, Some(777), true, "foc"),   // 序列结束（残留 777）
+            (0x0800992c, Some(782), false, "foc"),  // foc:782 区间开始
+            (0x08009938, Some(783), false, "foc"),  // foc:783
+            (0x08009940, None, true, "foc"),        // 最后序列结束
+        ];
+        // 0x0800992c 恰好是 foc:782 起点
+        assert_eq!(
+            pick_line_row(&events, 0x0800992c),
+            Some((0x0800992c, 782, "foc"))
+        );
+        // 0x0800991c 在 fmc:1105 区间内
+        assert_eq!(
+            pick_line_row(&events, 0x0800991c),
+            Some((0x0800991a, 1105, "fmc"))
+        );
+        // 0x08009928 是 foc:777 起点（fmc 序列已在此前结束，残留行号不可用）
+        assert_eq!(
+            pick_line_row(&events, 0x08009928),
+            Some((0x08009928, 777, "foc"))
+        );
+        // 区间中段归属所在行
+        assert_eq!(
+            pick_line_row(&events, 0x08009930),
+            Some((0x0800992c, 782, "foc"))
+        );
+        // 超出全部区间
+        assert_eq!(pick_line_row(&events, 0x08009940), None);
+    }
 
     fn base(name: &str, size: usize, encoding: Encoding) -> TypeDesc {
         TypeDesc::Base {

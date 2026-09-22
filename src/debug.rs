@@ -145,11 +145,9 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                     None => plot::list_plots(config),
                     Some(name) => match plot::prepare_plot(config, name) {
                         Err(e) => Err(e),
-                        Ok(prep) => plot::run_reused(
-                            &mut session,
-                            &prep,
-                            &format!("debug plot [{name}]"),
-                        ),
+                        Ok(prep) => {
+                            plot::run_reused(&mut session, &prep, &format!("debug plot [{name}]"))
+                        }
                     },
                 }
             }
