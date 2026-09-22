@@ -83,7 +83,11 @@ pub fn run(config: &ToolConfig, erase_all: bool, assume_yes: bool) -> Result<()>
     println!(
         "开始烧录 {}（{}）…",
         elf.display(),
-        if erase_all { "整片擦除" } else { "扇区擦除" }
+        if erase_all {
+            "整片擦除"
+        } else {
+            "扇区擦除"
+        }
     );
     let start = Instant::now();
     flashing::download_file_with_options(

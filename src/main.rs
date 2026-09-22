@@ -13,6 +13,7 @@ mod config;
 mod debug;
 mod flash;
 mod hexdump;
+mod plot;
 mod session;
 mod symbol;
 mod watch;
@@ -103,6 +104,13 @@ enum Cmd {
     Watch {
         /// 监视组名（对应 tscope.yaml 里 watch 节的键）；省略则列出所有组
         group: Option<String>,
+    },
+
+    /// 独立 GUI 窗口显示变量实时曲线（配置在 tscope.yaml 的 plot 节；
+    /// 滚轮缩放/拖拽平移/右键框选，双击/r 恢复滚动，空格暂停，+/− 窗口，s 导出 CSV）
+    Plot {
+        /// 曲线配置名（对应 tscope.yaml 里 plot 节的键）；省略则列出所有配置
+        name: Option<String>,
     },
 
     /// 烧录 firmware.elf 到芯片（默认扇区擦除 + 校验，不复位）
@@ -213,6 +221,13 @@ fn main() -> Result<()> {
             match group {
                 Some(g) => watch::run(&config, &g),
                 None => watch::list_groups(&config),
+            }
+        }
+        Cmd::Plot { name } => {
+            let config = load_config(&cli.config)?;
+            match name {
+                Some(n) => plot::run(&config, &n),
+                None => plot::list_plots(&config),
             }
         }
         Cmd::Flash { erase_all, yes } => {

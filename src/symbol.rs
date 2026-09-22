@@ -103,6 +103,14 @@ impl TypeDesc {
             | TypeDesc::Unsupported { name, .. } => name,
         }
     }
+
+    /// 是否可提取为曲线数值（标量/指针/枚举；复合类型不行）
+    pub(crate) fn is_plottable(&self) -> bool {
+        matches!(
+            self,
+            TypeDesc::Base { .. } | TypeDesc::Pointer { .. } | TypeDesc::Enum { .. }
+        )
+    }
 }
 
 /// 打印选项
@@ -112,6 +120,12 @@ pub struct FmtOptions {
     /// 嵌套展开深度上限（防自引用等极端情况）
     pub max_depth: usize,
 }
+
+/// 复合类型展开的子项行列表（标签后缀, 相对字段的字节偏移, 项类型）
+type ChildRows = Vec<(String, usize, TypeDesc)>;
+
+/// 本文件统一的 DWARF 读取器类型（运行期决定大小端）
+type DwarfReader = EndianRcSlice<RunTimeEndian>;
 
 /// 解析出的顶层符号
 struct SymbolInfo {
@@ -186,9 +200,7 @@ fn walk_path<'a>(root: &'a TypeDesc, path: &[PathSeg]) -> Result<(usize, &'a Typ
                     let m = members
                         .iter()
                         .find(|m| &m.name == name)
-                        .ok_or_else(|| {
-                            anyhow!("类型 {} 里没有成员 {name}", cur.name())
-                        })?;
+                        .ok_or_else(|| anyhow!("类型 {} 里没有成员 {name}", cur.name()))?;
                     offset += m.offset;
                     cur = &m.ty;
                 }
@@ -244,10 +256,7 @@ impl PreparedSymbol {
     pub fn read_base(&self, core: &mut Core) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; self.base_size];
         core.read_8(self.address, &mut buf).with_context(|| {
-            format!(
-                "读取 0x{:08x}（{} 字节）失败",
-                self.address, self.base_size
-            )
+            format!("读取 0x{:08x}（{} 字节）失败", self.address, self.base_size)
         })?;
         Ok(buf)
     }
@@ -261,7 +270,7 @@ impl PreparedSymbol {
     ///   数组元素   → `[i]`（多维为 `[i][j]`）
     /// 数组与结构体可任意交错（结构体数组 → `.member[i]` 等）。
     /// 非复合类型返回 None。
-    pub fn child_rows(&self, max_elems: usize) -> Option<(Vec<(String, usize, TypeDesc)>, usize)> {
+    pub fn child_rows(&self, max_elems: usize) -> Option<(ChildRows, usize)> {
         let total = leaf_count(&self.field_ty);
         match &self.field_ty {
             TypeDesc::Array { .. } | TypeDesc::Struct { .. } => {
@@ -287,6 +296,27 @@ impl PreparedSymbol {
         self.render_at(buf, 0, &self.field_ty)
     }
 
+    /// 只读目标字段本身的字节（plot 单符号采样用）。
+    /// 与 read_base 的区别：read_base 读整个基础变量（结构体可能几百字节），
+    /// 这里只读字段那几字节，SWD 流量小一个量级。
+    pub fn read_field(&self, core: &mut Core) -> Result<Vec<u8>> {
+        let size = self.byte_size();
+        let mut buf = vec![0u8; size];
+        core.read_8(self.field_address(), &mut buf)
+            .with_context(|| format!("读取 0x{:08x}（{} 字节）失败", self.field_address(), size))?;
+        Ok(buf)
+    }
+
+    /// 从 read_field 的缓冲区提取数值（plot 曲线用）：标量返回 Some(f64)
+    pub fn value_from_field(&self, buf: &[u8]) -> Option<f64> {
+        scalar_f64(buf, &self.field_ty)
+    }
+
+    /// 目标字段是否可参与曲线绘制
+    pub fn plottable(&self) -> bool {
+        self.field_ty.is_plottable()
+    }
+
     /// 采样缓冲区分组缓存用：标识同一个基础变量
     pub(crate) fn base_key(&self) -> (u64, usize) {
         (self.address, self.base_size)
@@ -309,7 +339,7 @@ fn collect_child_rows(
     base_off: usize,
     label: &str,
     budget: usize,
-    out: &mut Vec<(String, usize, TypeDesc)>,
+    out: &mut ChildRows,
 ) {
     if out.len() >= budget {
         return;
@@ -338,7 +368,13 @@ fn collect_child_rows(
                 if out.len() >= budget {
                     return;
                 }
-                collect_child_rows(&m.ty, base_off + m.offset, &format!("{label}.{}", m.name), budget, out);
+                collect_child_rows(
+                    &m.ty,
+                    base_off + m.offset,
+                    &format!("{label}.{}", m.name),
+                    budget,
+                    out,
+                );
             }
         }
         // 标量 / 指针 / 枚举 / 位域（不支持占位）：叶子行
@@ -461,8 +497,8 @@ pub fn print_global_value(
 
 /// 打开 ELF → 加载 DWARF 段 → 逐编译单元找目标变量
 fn find_symbol(elf_path: &Path, symbol: &str) -> Result<SymbolInfo> {
-    let data =
-        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let data = std::fs::read(elf_path)
+        .with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
     let obj = object::File::parse(&*data).context("解析 ELF 失败（确认文件是 .elf 不是 .bin）")?;
 
     let endian = if obj.is_little_endian() {
@@ -472,17 +508,16 @@ fn find_symbol(elf_path: &Path, symbol: &str) -> Result<SymbolInfo> {
     };
 
     // 把 ELF 里的 .debug_* 段交给 gimli（缺失的段按空处理）
-    let mut load_section =
-        |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
-            let bytes = obj
-                .section_by_name(id.name())
-                .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
-                .unwrap_or_default();
-            Ok(EndianRcSlice::new(
-                std::rc::Rc::from(bytes.as_slice()),
-                endian,
-            ))
-        };
+    let mut load_section = |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
+        let bytes = obj
+            .section_by_name(id.name())
+            .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
+            .unwrap_or_default();
+        Ok(EndianRcSlice::new(
+            std::rc::Rc::from(bytes.as_slice()),
+            endian,
+        ))
+    };
     let dwarf_sections =
         gimli::DwarfSections::load(&mut load_section).context("加载 DWARF 调试信息失败")?;
     let dwarf = dwarf_sections.borrow(|section| section.clone());
@@ -581,9 +616,7 @@ fn entry_name_matches<R: Reader<Offset = usize>>(
 ) -> Result<bool> {
     for attr in entry.attrs().iter() {
         match attr.name() {
-            gimli::DW_AT_name
-            | gimli::DW_AT_linkage_name
-            | gimli::DW_AT_MIPS_linkage_name => {
+            gimli::DW_AT_name | gimli::DW_AT_linkage_name | gimli::DW_AT_MIPS_linkage_name => {
                 let raw = dwarf.attr_string(unit, attr.value())?;
                 if raw.to_string_lossy()? == target {
                     return Ok(true);
@@ -596,10 +629,7 @@ fn entry_name_matches<R: Reader<Offset = usize>>(
 }
 
 /// 在 ELF 符号表（.symtab）里找全局符号的链接后地址；找不到返回 0
-fn symbol_table_address<'data>(
-    obj: &object::File<'data, &'data [u8]>,
-    name: &str,
-) -> Result<u64> {
+fn symbol_table_address<'data>(obj: &object::File<'data, &'data [u8]>, name: &str) -> Result<u64> {
     for sym in obj.symbols() {
         let Ok(sym_name) = sym.name() else { continue };
         if sym_name != name {
@@ -616,8 +646,8 @@ fn symbol_table_address<'data>(
 /// Cortex-M 是 Thumb 架构，符号地址最低位是 1（Thumb 标记），
 /// 断点地址必须是偶数指令地址，这里统一清掉最低位。
 pub fn code_symbol_address(elf_path: &Path, name: &str) -> Result<u64> {
-    let data =
-        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let data = std::fs::read(elf_path)
+        .with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
     let obj = object::File::parse(&*data).context("解析 ELF 失败")?;
     let addr = symbol_table_address(&obj, name)?;
     if addr == 0 {
@@ -662,11 +692,11 @@ pub fn function_name_at(elf_path: &Path, addr: u64) -> Option<String> {
 pub(crate) fn load_debug_data(
     elf_path: &Path,
 ) -> Result<(
-    Dwarf<EndianRcSlice<RunTimeEndian>>,
+    Dwarf<DwarfReader>,
     gimli::read::DebugFrame<EndianRcSlice<RunTimeEndian>>,
 )> {
-    let data =
-        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+    let data = std::fs::read(elf_path)
+        .with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
     let obj = object::File::parse(&*data).context("解析 ELF 失败（确认文件是 .elf）")?;
 
     let endian = if obj.is_little_endian() {
@@ -675,17 +705,16 @@ pub(crate) fn load_debug_data(
         RunTimeEndian::Big
     };
 
-    let mut load_section =
-        |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
-            let bytes = obj
-                .section_by_name(id.name())
-                .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
-                .unwrap_or_default();
-            Ok(EndianRcSlice::new(
-                std::rc::Rc::from(bytes.as_slice()),
-                endian,
-            ))
-        };
+    let mut load_section = |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
+        let bytes = obj
+            .section_by_name(id.name())
+            .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
+            .unwrap_or_default();
+        Ok(EndianRcSlice::new(
+            std::rc::Rc::from(bytes.as_slice()),
+            endian,
+        ))
+    };
     let dwarf_sections =
         gimli::DwarfSections::load(&mut load_section).context("加载 DWARF 调试信息失败")?;
     let dwarf = dwarf_sections.borrow(|section| section.clone());
@@ -716,12 +745,9 @@ pub(crate) fn load_debug_data(
 }
 
 /// 加载 ELF 的 DWARF 并执行闭包（行号表查询等一次性用途）
-fn with_dwarf<T>(
-    elf_path: &Path,
-    f: impl FnOnce(&Dwarf<EndianRcSlice<RunTimeEndian>>) -> Result<T>,
-) -> Result<T> {
-    let data =
-        std::fs::read(elf_path).with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
+fn with_dwarf<T>(elf_path: &Path, f: impl FnOnce(&Dwarf<DwarfReader>) -> Result<T>) -> Result<T> {
+    let data = std::fs::read(elf_path)
+        .with_context(|| format!("读取 ELF 失败：{}", elf_path.display()))?;
     let obj = object::File::parse(&*data).context("解析 ELF 失败（确认文件是 .elf）")?;
 
     let endian = if obj.is_little_endian() {
@@ -730,17 +756,16 @@ fn with_dwarf<T>(
         RunTimeEndian::Big
     };
 
-    let mut load_section =
-        |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
-            let bytes = obj
-                .section_by_name(id.name())
-                .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
-                .unwrap_or_default();
-            Ok(EndianRcSlice::new(
-                std::rc::Rc::from(bytes.as_slice()),
-                endian,
-            ))
-        };
+    let mut load_section = |id: SectionId| -> Result<EndianRcSlice<RunTimeEndian>, gimli::Error> {
+        let bytes = obj
+            .section_by_name(id.name())
+            .map(|s| s.data().map(|d| d.to_vec()).unwrap_or_default())
+            .unwrap_or_default();
+        Ok(EndianRcSlice::new(
+            std::rc::Rc::from(bytes.as_slice()),
+            endian,
+        ))
+    };
     let dwarf_sections =
         gimli::DwarfSections::load(&mut load_section).context("加载 DWARF 调试信息失败")?;
     let dwarf = dwarf_sections.borrow(|section| section.clone());
@@ -849,14 +874,13 @@ fn is_absolute_path(s: &str) -> bool {
 }
 
 /// 收集行号表里与 wanted 匹配的所有文件路径（去重，保留各自最高匹配强度）
-fn collect_matching_files(
-    dwarf: &Dwarf<EndianRcSlice<RunTimeEndian>>,
-    wanted: &str,
-) -> Vec<(u32, String)> {
+fn collect_matching_files(dwarf: &Dwarf<DwarfReader>, wanted: &str) -> Vec<(u32, String)> {
     let mut found: Vec<(u32, String)> = Vec::new();
     let mut units = dwarf.units();
     while let Ok(Some(header)) = units.next() {
-        let Ok(unit) = dwarf.unit(header) else { continue };
+        let Ok(unit) = dwarf.unit(header) else {
+            continue;
+        };
         let Some(program) = unit.line_program.clone() else {
             continue;
         };
@@ -1118,12 +1142,22 @@ fn resolve_type<R: Reader<Offset = usize>>(
             }
         }
 
-        gimli::DW_TAG_structure_type => {
-            parse_compound(dwarf, unit, &entry, CompoundKind::Struct, inherited_name, depth)
-        }
-        gimli::DW_TAG_union_type => {
-            parse_compound(dwarf, unit, &entry, CompoundKind::Union, inherited_name, depth)
-        }
+        gimli::DW_TAG_structure_type => parse_compound(
+            dwarf,
+            unit,
+            &entry,
+            CompoundKind::Struct,
+            inherited_name,
+            depth,
+        ),
+        gimli::DW_TAG_union_type => parse_compound(
+            dwarf,
+            unit,
+            &entry,
+            CompoundKind::Union,
+            inherited_name,
+            depth,
+        ),
         gimli::DW_TAG_array_type => parse_array(dwarf, unit, &entry, inherited_name, depth),
         gimli::DW_TAG_enumeration_type => parse_enum(dwarf, unit, &entry, inherited_name),
 
@@ -1136,7 +1170,8 @@ fn resolve_type<R: Reader<Offset = usize>>(
             let byte_size = entry
                 .attr_value(gimli::DW_AT_byte_size)
                 .and_then(|v| v.udata_value())
-                .unwrap_or(u64::from(unit.encoding().address_size)) as usize;
+                .unwrap_or(u64::from(unit.encoding().address_size))
+                as usize;
             Ok(TypeDesc::Pointer { name, byte_size })
         }
 
@@ -1185,12 +1220,12 @@ fn parse_base_type<R: Reader<Offset = usize>>(
 
     let base_name = base_name.unwrap_or_else(|| "?".to_string());
     let name = inherited_name.unwrap_or_else(|| base_name.clone());
-    let size = size
-        .ok_or_else(|| anyhow!("基类型 {base_name} 没有字节数"))?
-        as usize;
+    let size = size.ok_or_else(|| anyhow!("基类型 {base_name} 没有字节数"))? as usize;
     let encoding = match encoding {
         Some(e) if e == gimli::DW_ATE_float.0 as u64 => Encoding::Float,
-        Some(e) if e == gimli::DW_ATE_signed.0 as u64 || e == gimli::DW_ATE_signed_char.0 as u64 => {
+        Some(e)
+            if e == gimli::DW_ATE_signed.0 as u64 || e == gimli::DW_ATE_signed_char.0 as u64 =>
+        {
             Encoding::Signed
         }
         Some(e)
@@ -1220,12 +1255,10 @@ fn parse_compound<R: Reader<Offset = usize>>(
     depth: usize,
 ) -> Result<TypeDesc> {
     let own_name = entry_name(dwarf, unit, entry);
-    let name = own_name
-        .or(inherited_name)
-        .unwrap_or_else(|| match kind {
-            CompoundKind::Struct => "<结构体>".to_string(),
-            CompoundKind::Union => "<联合体>".to_string(),
-        });
+    let name = own_name.or(inherited_name).unwrap_or_else(|| match kind {
+        CompoundKind::Struct => "<结构体>".to_string(),
+        CompoundKind::Union => "<联合体>".to_string(),
+    });
 
     let declared_size = entry
         .attr_value(gimli::DW_AT_byte_size)
@@ -1234,67 +1267,66 @@ fn parse_compound<R: Reader<Offset = usize>>(
 
     let mut members = Vec::new();
 
-    let mut tree = unit.entries_tree(Some(entry.offset())).context("遍历成员失败")?;
+    let mut tree = unit
+        .entries_tree(Some(entry.offset()))
+        .context("遍历成员失败")?;
     let root = tree.root()?;
     let mut children = root.children();
     while let Some(child) = children.next().context("遍历成员失败")? {
         let child_entry = child.entry();
-        match child_entry.tag() {
-            gimli::DW_TAG_member => {
-                // 位域：不解析内部结构，占位说明
-                if child_entry.attr(gimli::DW_AT_bit_size).is_some() {
-                    let mname = entry_name(dwarf, unit, child_entry)
-                        .unwrap_or_else(|| "<位域>".to_string());
-                    members.push(Member {
-                        name: mname.clone(),
-                        offset: 0,
-                        ty: TypeDesc::Unsupported {
-                            name: mname,
-                            reason: "位域暂不支持".to_string(),
-                        },
-                    });
-                    continue;
-                }
-
-                let mname = entry_name(dwarf, unit, child_entry)
-                    .unwrap_or_else(|| "<匿名成员>".to_string());
-
-                // 联合体成员没有 data_member_location（全部偏移 0），按 0 处理；
-                // 结构体成员缺偏移才是异常。
-                let offset = member_offset(unit, child_entry)
-                    .or(match kind {
-                        CompoundKind::Union => Some(0),
-                        CompoundKind::Struct => None,
-                    })
-                    .ok_or_else(|| {
-                        anyhow!("成员 {mname} 没有可解析的偏移（location 表达式太复杂？）")
-                    })?;
-
-                let ty = match child_entry.attr_value(gimli::DW_AT_type) {
-                    Some(AttributeValue::UnitRef(o)) => {
-                        // 注意：这里不传成员名作 inherited_name —— typedef 名由
-                        // 类型链自己提供；成员名只是成员名，不能冒充类型名
-                        match resolve_type(dwarf, unit, o, None, depth + 1) {
-                            Ok(ty) => ty,
-                            Err(e) => TypeDesc::Unsupported {
-                                name: mname.clone(),
-                                reason: format!("成员类型解析失败: {e:#}"),
-                            },
-                        }
-                    }
-                    _ => TypeDesc::Unsupported {
-                        name: mname.clone(),
-                        reason: "成员缺少类型信息".to_string(),
-                    },
-                };
-
+        if child_entry.tag() == gimli::DW_TAG_member {
+            // 位域：不解析内部结构，占位说明
+            if child_entry.attr(gimli::DW_AT_bit_size).is_some() {
+                let mname =
+                    entry_name(dwarf, unit, child_entry).unwrap_or_else(|| "<位域>".to_string());
                 members.push(Member {
-                    name: mname,
-                    offset,
-                    ty,
+                    name: mname.clone(),
+                    offset: 0,
+                    ty: TypeDesc::Unsupported {
+                        name: mname,
+                        reason: "位域暂不支持".to_string(),
+                    },
                 });
+                continue;
             }
-            _ => {}
+
+            let mname =
+                entry_name(dwarf, unit, child_entry).unwrap_or_else(|| "<匿名成员>".to_string());
+
+            // 联合体成员没有 data_member_location（全部偏移 0），按 0 处理；
+            // 结构体成员缺偏移才是异常。
+            let offset = member_offset(unit, child_entry)
+                .or(match kind {
+                    CompoundKind::Union => Some(0),
+                    CompoundKind::Struct => None,
+                })
+                .ok_or_else(|| {
+                    anyhow!("成员 {mname} 没有可解析的偏移（location 表达式太复杂？）")
+                })?;
+
+            let ty = match child_entry.attr_value(gimli::DW_AT_type) {
+                Some(AttributeValue::UnitRef(o)) => {
+                    // 注意：这里不传成员名作 inherited_name —— typedef 名由
+                    // 类型链自己提供；成员名只是成员名，不能冒充类型名
+                    match resolve_type(dwarf, unit, o, None, depth + 1) {
+                        Ok(ty) => ty,
+                        Err(e) => TypeDesc::Unsupported {
+                            name: mname.clone(),
+                            reason: format!("成员类型解析失败: {e:#}"),
+                        },
+                    }
+                }
+                _ => TypeDesc::Unsupported {
+                    name: mname.clone(),
+                    reason: "成员缺少类型信息".to_string(),
+                },
+            };
+
+            members.push(Member {
+                name: mname,
+                offset,
+                ty,
+            });
         }
     }
 
@@ -1359,7 +1391,9 @@ fn parse_array<R: Reader<Offset = usize>>(
     };
 
     let mut dims: Vec<usize> = Vec::new();
-    let mut tree = unit.entries_tree(Some(entry.offset())).context("遍历数组定义失败")?;
+    let mut tree = unit
+        .entries_tree(Some(entry.offset()))
+        .context("遍历数组定义失败")?;
     let root = tree.root()?;
     let mut children = root.children();
     while let Some(child) = children.next().context("遍历数组定义失败")? {
@@ -1435,7 +1469,9 @@ fn parse_enum<R: Reader<Offset = usize>>(
         .unwrap_or(4) as usize;
 
     let mut variants = Vec::new();
-    let mut tree = unit.entries_tree(Some(entry.offset())).context("遍历枚举器失败")?;
+    let mut tree = unit
+        .entries_tree(Some(entry.offset()))
+        .context("遍历枚举器失败")?;
     let root = tree.root()?;
     let mut children = root.children();
     while let Some(child) = children.next().context("遍历枚举器失败")? {
@@ -1446,7 +1482,10 @@ fn parse_enum<R: Reader<Offset = usize>>(
         let vname = entry_name(dwarf, unit, child_entry).unwrap_or_else(|| "?".to_string());
         let value = child_entry
             .attr_value(gimli::DW_AT_const_value)
-            .and_then(|v| v.sdata_value().or_else(|| v.udata_value().map(|u| u as i64)))
+            .and_then(|v| {
+                v.sdata_value()
+                    .or_else(|| v.udata_value().map(|u| u as i64))
+            })
             .unwrap_or(0);
         variants.push((vname, value));
     }
@@ -1472,6 +1511,36 @@ fn le_u64(buf: &[u8], n: usize) -> u64 {
         v |= u64::from(*b) << (8 * i);
     }
     v
+}
+
+/// 标量类型的内存字节 → f64（plot 曲线用，小端）。复合/不支持类型或缓冲区不足返回 None。
+fn scalar_f64(buf: &[u8], ty: &TypeDesc) -> Option<f64> {
+    let size = ty.byte_size()?;
+    if buf.len() < size {
+        return None;
+    }
+    match ty {
+        TypeDesc::Base {
+            encoding,
+            byte_size,
+            ..
+        } => match (encoding, byte_size) {
+            (Encoding::Float, 4) => Some(f64::from(f32::from_le_bytes(
+                buf.get(..4)?.try_into().ok()?,
+            ))),
+            (Encoding::Float, 8) => Some(f64::from_le_bytes(buf.get(..8)?.try_into().ok()?)),
+            (Encoding::Signed, 1) => Some(f64::from(*buf.first()? as i8)),
+            (Encoding::Signed, 2) => Some(f64::from(le_u64(buf, 2) as i16)),
+            (Encoding::Signed, 4) => Some(f64::from(le_u64(buf, 4) as i32)),
+            (Encoding::Signed, 8) => Some(le_u64(buf, 8) as i64 as f64),
+            (Encoding::Unsigned, n) => Some(le_u64(buf, *n) as f64),
+            _ => None,
+        },
+        TypeDesc::Pointer { byte_size, .. } | TypeDesc::Enum { byte_size, .. } => {
+            Some(le_u64(buf, *byte_size) as f64)
+        }
+        _ => None,
+    }
 }
 
 /// 按编码 + 字节数把内存字节解释成可读文本（小端）
@@ -1558,9 +1627,7 @@ fn render(buf: &[u8], ty: &TypeDesc, opts: &FmtOptions, depth: usize) -> String 
             lines.join("\n")
         }
 
-        TypeDesc::Struct {
-            members, kind, ..
-        } => {
+        TypeDesc::Struct { members, kind, .. } => {
             if depth >= opts.max_depth {
                 return "…".to_string();
             }
@@ -1611,5 +1678,76 @@ fn render(buf: &[u8], ty: &TypeDesc, opts: &FmtOptions, depth: usize) -> String 
         }
 
         TypeDesc::Unsupported { reason, .. } => format!("〈{reason}〉"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(name: &str, size: usize, encoding: Encoding) -> TypeDesc {
+        TypeDesc::Base {
+            name: name.to_string(),
+            byte_size: size,
+            encoding,
+        }
+    }
+
+    #[test]
+    fn scalar_f64_decodes_little_endian() {
+        assert_eq!(
+            scalar_f64(
+                &[0xA0, 0x86, 0x01, 0x00],
+                &base("uint32_t", 4, Encoding::Unsigned)
+            ),
+            Some(100000.0)
+        );
+        assert_eq!(
+            scalar_f64(&[0x2E, 0xFB], &base("int16_t", 2, Encoding::Signed)),
+            Some(-1234.0)
+        );
+        assert_eq!(
+            scalar_f64(&1.5f32.to_le_bytes(), &base("float", 4, Encoding::Float)),
+            Some(1.5)
+        );
+        assert_eq!(
+            scalar_f64(&[0xFF], &base("uint8_t", 1, Encoding::Unsigned)),
+            Some(255.0)
+        );
+    }
+
+    #[test]
+    fn scalar_f64_rejects_compound_and_short_buf() {
+        let arr = TypeDesc::Array {
+            name: "int[4]".to_string(),
+            elem: Box::new(base("int", 4, Encoding::Signed)),
+            count: 4,
+        };
+        assert_eq!(scalar_f64(&[0; 16], &arr), None);
+        // 缓冲区不够长
+        assert_eq!(
+            scalar_f64(&[1, 2], &base("uint32_t", 4, Encoding::Unsigned)),
+            None
+        );
+        assert!(!arr.is_plottable());
+        assert!(base("float", 4, Encoding::Float).is_plottable());
+    }
+
+    #[test]
+    fn pointer_and_enum_are_plottable() {
+        let ptr = TypeDesc::Pointer {
+            name: "int*".to_string(),
+            byte_size: 4,
+        };
+        let en = TypeDesc::Enum {
+            name: "mode".to_string(),
+            byte_size: 4,
+            variants: vec![],
+        };
+        assert_eq!(
+            scalar_f64(&[0x78, 0x56, 0x34, 0x12], &ptr),
+            Some(305_419_896.0)
+        );
+        assert_eq!(scalar_f64(&[0x2A, 0, 0, 0], &en), Some(42.0));
     }
 }

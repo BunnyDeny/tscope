@@ -1,0 +1,9 @@
+[package]
+name = "tscope-plot"
+version = "0.1.0"
+edition = "2021"
+description = "tscope 曲线 GUI 的最小演示：Rust 本地生成动态正弦波，验证 eframe + egui_plot 显示方案"
+
+[dependencies]
+eframe = "0.36"
+egui_plot = "0.37"

@@ -97,14 +97,16 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 // 注意：命令分支里的 ? 必须包在闭包里，否则会直接返回 run()
                 // 退出整个会话（主循环的错误捕获就失效了）
                 (|| -> Result<()> {
-                    let elf = elf
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("reset 需要 firmware.elf 来解析函数地址（复位后暂停在函数开头）"))?;
+                    let elf = elf.as_deref().ok_or_else(|| {
+                        anyhow!("reset 需要 firmware.elf 来解析函数地址（复位后暂停在函数开头）")
+                    })?;
                     debug_reset(&mut session, elf, target, &breakpoints)
                 })()
             }
             "bp" => match arg {
-                Some(target) => debug_bp_add(&mut session, elf.as_deref(), target, &mut breakpoints),
+                Some(target) => {
+                    debug_bp_add(&mut session, elf.as_deref(), target, &mut breakpoints)
+                }
                 None => Err(anyhow!(
                     "用法：bp <地址|函数名|文件:行号>，如 bp main / bp 0x08004200 / bp foc.c:123"
                 )),
@@ -201,7 +203,8 @@ tscope 会自动恢复，无需重新 bp。"#
 /// 运行中则自动先暂停（暂停成功后才提示），返回暂停后的内核
 fn ensure_halted(core: &mut Core, verbose: bool) -> Result<()> {
     if !core.core_halted()? {
-        core.halt(HALT_TIMEOUT).context("暂停失败（超时？接线/供电？）")?;
+        core.halt(HALT_TIMEOUT)
+            .context("暂停失败（超时？接线/供电？）")?;
         if verbose {
             // 提示放在暂停成功之后：描述「已发生的动作」，而不是指引用户去暂停
             println!("（内核在运行，已自动暂停）");
@@ -212,7 +215,9 @@ fn ensure_halted(core: &mut Core, verbose: bool) -> Result<()> {
 
 fn debug_halt(session: &mut Session) -> Result<()> {
     let mut core = session.core(0)?;
-    let info = core.halt(HALT_TIMEOUT).context("暂停失败（超时？接线/供电？）")?;
+    let info = core
+        .halt(HALT_TIMEOUT)
+        .context("暂停失败（超时？接线/供电？）")?;
     println!("已暂停，PC = 0x{:08x}", info.pc);
     Ok(())
 }
@@ -235,16 +240,14 @@ fn debug_run(
         return Ok(());
     }
 
-    println!("已继续运行，等待断点命中（{} 秒超时）…", BP_WAIT_TIMEOUT.as_secs());
+    println!(
+        "已继续运行，等待断点命中（{} 秒超时）…",
+        BP_WAIT_TIMEOUT.as_secs()
+    );
     match core.wait_for_core_halted(BP_WAIT_TIMEOUT) {
         Ok(()) => {
             let pc: u32 = core
-                .read_core_reg(
-                    core.registers()
-                        .pc()
-                        .context("找不到 PC 寄存器定义")?
-                        .id(),
-                )
+                .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
                 .context("读 PC 失败")?;
             let pc = (pc & !1) as u64;
             match breakpoints.iter().position(|b| b.addr == pc) {
@@ -279,7 +282,10 @@ fn debug_bp_add(
     let addr = resolve_target(elf, target)?;
 
     if breakpoints.iter().any(|b| b.addr == addr) {
-        println!("0x{addr:08x} 已有断点（{}）", breakpoints.iter().find(|b| b.addr == addr).unwrap().desc);
+        println!(
+            "0x{addr:08x} 已有断点（{}）",
+            breakpoints.iter().find(|b| b.addr == addr).unwrap().desc
+        );
         return Ok(());
     }
 
@@ -339,7 +345,12 @@ fn debug_bp_clear(
         .parse()
         .ok()
         .filter(|i| *i >= 1 && *i <= breakpoints.len())
-        .ok_or_else(|| anyhow!("无效的断点编号 {which}（当前共 {} 个，用 bl 查看）", breakpoints.len()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "无效的断点编号 {which}（当前共 {} 个，用 bl 查看）",
+                breakpoints.len()
+            )
+        })?;
 
     let b = &breakpoints[idx - 1];
     let addr = b.addr;
@@ -353,12 +364,7 @@ fn debug_bp_clear(
 
 fn read_pc(core: &mut probe_rs::Core) -> Result<u64> {
     let pc: u32 = core
-        .read_core_reg(
-            core.registers()
-                .pc()
-                .context("找不到 PC 寄存器定义")?
-                .id(),
-        )
+        .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
         .context("读 PC 失败")?;
     Ok(pc as u64)
 }
@@ -416,7 +422,7 @@ fn run_out_of_function(session: &mut Session, elf: &std::path::Path) -> Result<(
         None => {
             // 无展开信息：退化为指令单步
             let info = core.step().context("单步失败")?;
-            print_pc(info.pc as u64, Some(elf));
+            print_pc(info.pc, Some(elf));
         }
     }
     Ok(())
@@ -428,11 +434,10 @@ fn debug_step(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()
     let start_pc = read_pc(&mut core)?;
 
     // 无行号信息（汇编/库代码）：直接指令单步
-    let Some((start_file, start_line)) =
-        elf.and_then(|e| symbol::address_to_line(e, start_pc))
+    let Some((start_file, start_line)) = elf.and_then(|e| symbol::address_to_line(e, start_pc))
     else {
         let info = core.step().context("单步失败")?;
-        print_pc(info.pc as u64, elf);
+        print_pc(info.pc, elf);
         return Ok(());
     };
 
@@ -474,7 +479,7 @@ fn debug_stepi(session: &mut Session, elf: Option<&std::path::Path>) -> Result<(
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
     let info = core.step().context("单步失败")?;
-    print_pc(info.pc as u64, elf);
+    print_pc(info.pc, elf);
     Ok(())
 }
 
@@ -496,21 +501,16 @@ fn debug_pc(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()> 
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
     let pc: u32 = core
-        .read_core_reg(
-            core.registers()
-                .pc()
-                .context("找不到 PC 寄存器定义")?
-                .id(),
-        )
+        .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
         .context("读 PC 失败")?;
     print_pc(pc as u64, elf);
 
     // SP / LR：Cortex-M 的寄存器表里架构名是 R13 / R14（没有 "SP"/"LR" 别名），
     // 按名字链查找；找不到或读不了都明确提示，而不是静默跳过。
     for (label, names) in [("SP", &["R13", "SP"][..]), ("LR", &["R14", "LR", "RA"][..])] {
-        let found = names.iter().find_map(|n| {
-            core.registers().core_registers().find(|r| r.name() == *n)
-        });
+        let found = names
+            .iter()
+            .find_map(|n| core.registers().core_registers().find(|r| r.name() == *n));
         match found {
             Some(reg) => match core.read_core_reg::<u32>(reg.id()) {
                 Ok(v) => println!("{label} = 0x{v:08x}"),
@@ -546,12 +546,7 @@ fn debug_reset(
     match core.wait_for_core_halted(BP_WAIT_TIMEOUT) {
         Ok(()) => {
             let pc: u32 = core
-                .read_core_reg(
-                    core.registers()
-                        .pc()
-                        .context("找不到 PC 寄存器定义")?
-                        .id(),
-                )
+                .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
                 .context("读 PC 失败")?;
             print!("已暂停在 {target} 开头：");
             print_pc(pc as u64, Some(elf));
@@ -583,11 +578,7 @@ fn debug_reset(
 }
 
 /// bt：打印当前函数调用栈（#0 是最内层）
-fn debug_bt(
-    session: &mut Session,
-    elf: Option<&std::path::Path>,
-    max_frames: usize,
-) -> Result<()> {
+fn debug_bt(session: &mut Session, elf: Option<&std::path::Path>, max_frames: usize) -> Result<()> {
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
     let elf = elf.ok_or_else(|| anyhow!("bt 需要 firmware.elf（.debug_frame 栈展开表）"))?;
@@ -630,18 +621,12 @@ fn debug_list_current(session: &mut Session, elf: Option<&std::path::Path>) -> R
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
     let pc: u32 = core
-        .read_core_reg(
-            core.registers()
-                .pc()
-                .context("找不到 PC 寄存器定义")?
-                .id(),
-        )
+        .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
         .context("读 PC 失败")?;
 
     let elf = elf.ok_or_else(|| anyhow!("list 需要 firmware.elf 来反查当前源码位置"))?;
-    let (file, line) = symbol::address_to_line(elf, pc as u64).ok_or_else(|| {
-        anyhow!("当前 PC 0x{pc:08x} 没有对应的源码行（汇编/库代码？）")
-    })?;
+    let (file, line) = symbol::address_to_line(elf, pc as u64)
+        .ok_or_else(|| anyhow!("当前 PC 0x{pc:08x} 没有对应的源码行（汇编/库代码？）"))?;
     print_source_context(&file, line)
 }
 
@@ -695,8 +680,7 @@ fn resolve_target(elf: Option<&std::path::Path>, s: &str) -> Result<u64> {
         if hex.is_empty() {
             bail!("地址不能为空");
         }
-        return u64::from_str_radix(hex, 16)
-            .with_context(|| format!("无效的十六进制地址：{t}"));
+        return u64::from_str_radix(hex, 16).with_context(|| format!("无效的十六进制地址：{t}"));
     }
 
     // 纯十六进制数字且足够长（≥8 位，避免把符号名误判成地址）
@@ -708,8 +692,8 @@ fn resolve_target(elf: Option<&std::path::Path>, s: &str) -> Result<u64> {
     if let Some((file, line_str)) = t.rsplit_once(':') {
         if let Ok(line) = line_str.parse::<u64>() {
             if file.contains('/') || file.contains('\\') || file.contains('.') {
-                let elf = elf
-                    .ok_or_else(|| anyhow!("目标是源文件位置 {t}，但配置里没有 firmware.elf"))?;
+                let elf =
+                    elf.ok_or_else(|| anyhow!("目标是源文件位置 {t}，但配置里没有 firmware.elf"))?;
                 return symbol::line_to_address(elf, file, line);
             }
         }

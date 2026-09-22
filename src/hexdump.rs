@@ -245,15 +245,21 @@ fn validate(opts: &DumpOptions) -> Result<()> {
         bail!("length 必须大于 0");
     }
     if opts.length > MAX_DUMP_BYTES {
-        bail!("单次转储上限 {MAX_DUMP_BYTES} 字节（请求 {}），防手滑请分段读", opts.length);
+        bail!(
+            "单次转储上限 {MAX_DUMP_BYTES} 字节（请求 {}），防手滑请分段读",
+            opts.length
+        );
     }
     if !matches!(opts.width, 4 | 8 | 16 | 32) {
-        bail!("width 只支持 4 / 8 / 16 / 32 字节每行（当前 {}）", opts.width);
+        bail!(
+            "width 只支持 4 / 8 / 16 / 32 字节每行（当前 {}）",
+            opts.width
+        );
     }
     if !matches!(opts.group, 1 | 2 | 4 | 8) {
         bail!("group 只支持 1 / 2 / 4 / 8 字节每组（当前 {}）", opts.group);
     }
-    if opts.width % opts.group != 0 {
+    if !opts.width.is_multiple_of(opts.group) {
         bail!("group（{}）必须整除 width（{}）", opts.group, opts.width);
     }
     Ok(())
@@ -268,13 +274,12 @@ fn read_region(session: &mut Session, address: u64, length: u64) -> Result<Vec<u
 
     let mut core = session.core(0)?;
     let mut words = vec![0u32; word_count as usize];
-    core.read_32(word_start, &mut words)
-        .with_context(|| {
-            format!(
-                "读取 0x{word_start:08x} 起 {} 字节失败（芯片未上电？地址无效？）",
-                word_count * 4
-            )
-        })?;
+    core.read_32(word_start, &mut words).with_context(|| {
+        format!(
+            "读取 0x{word_start:08x} 起 {} 字节失败（芯片未上电？地址无效？）",
+            word_count * 4
+        )
+    })?;
     let all: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let skip = (address - word_start) as usize;
     Ok(all[skip..skip + length as usize].to_vec())
@@ -319,10 +324,9 @@ fn print_rows(bytes: &[u8], opts: &DumpOptions) {
                     hex.push(' ');
                 }
             }
-            if i < row_len {
-                hex.push_str(&format!("{:02x}", row[i]));
-            } else {
-                hex.push_str("  ");
+            match row.get(i) {
+                Some(b) => hex.push_str(&format!("{b:02x}")),
+                None => hex.push_str("  "),
             }
         }
 

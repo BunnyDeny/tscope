@@ -4,9 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "基于 probe-rs 库的嵌入式调试/监视工具（YAML 配置驱动）"
 
+# 工作区：crates/tscope-plot 是曲线 GUI 库（eframe + egui_plot），
+# 先在独立目录开发验证、后并入；demo 示例保留在 crates/tscope-plot/examples
+[workspace]
+members = ["crates/tscope-plot"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+
+# 曲线 GUI 库（plot 子命令）：本地路径依赖，与主程序同仓库同版本管理
+tscope-plot = { path = "crates/tscope-plot" }
 
 # probe-rs：来自 crates.io，cargo build 时自动下载，无需手动克隆其源码。
 # 版本锁定 0.32（与本工具开发时使用的版本一致；上游 API 变更时再显式升级）。

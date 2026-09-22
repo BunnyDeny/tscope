@@ -39,6 +39,16 @@ ENC_1_POS_SENSOR (positionStruct) = {
 - `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
   - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
   - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU
+- `plot`：**独立 GUI 窗口**的实时变量曲线（eframe + egui_plot，跨平台 Windows/Linux/macOS）
+  - 曲线配置在 `tscope.yaml` 的 `plot` 节（结构类似 watch 组），`tscope plot <配置名>` 打开
+  - **图组模型**：每个图组 = 一个子图，组内符号同图共 Y 轴（图例列出组内符号），
+    多组上下叠放、**共享 X 轴联动**（任一图缩放/平移，全体 X 同步；Y 各自独立）
+  - 滚动窗口（X 右缘 = 最新数据，J-Scope/VOFA+ 式）；只支持标量符号，复合类型请写成员路径
+  - 鼠标：滚轮缩放（X/Y 同时、光标锚定）、左键拖拽平移、右键框选缩放、双击复位并恢复滚动；
+    键盘：空格全局暂停、+/− 调窗口、r 恢复滚动、s 导出 CSV（当前目录）
+  - 采样线程独占 probe-rs 会话经 mpsc 送入 UI（`crates/tscope-plot` 库，与主程序同仓库）；
+    同一符号出现在多个图时只采样一次
+  - 采样率受 SWD 轮询限制（默认 20ms ≈ 50Hz，趋势监视够用）；高带宽需 RTT（见路线图）
 - `flash`：把 `firmware.elf` 烧录到芯片（probe-rs 内置烧写算法，终端里多阶段进度条）
   - 默认**扇区擦除**：只擦 ELF 覆盖的扇区，bootloader 不受影响；烧写后自动回读校验
   - `--erase_all` 整片擦除：永久删除 bootloader，执行前必须输入 `yes` 确认（`--yes` 跳过，供脚本）
@@ -335,6 +345,33 @@ watch:
 个别严格的 YAML 1.1 工具会把 `yes` 之类当布尔值，若文件还要给别的工具读，
 建议加引号（`"yes":`）——tscope 本身不受影响。
 
+### `plot` —— 曲线显示（独立 GUI 窗口）
+
+定义曲线窗口的图组划分（结构类似 watch 组），键是配置名
+（`tscope plot <配置名>` 的参数），可定义任意多个：
+
+```yaml
+plot:
+  plot1:                    # 配置名自定
+    interval_ms: 20         # 采样周期（毫秒），默认 20（≈50 Hz，滚动接近平滑）
+    window_secs: 5.0        # 滚动窗口宽度（秒），默认 5；X 右缘 = 最新数据
+    groups:                 # 图组：每个元素 = 一个子图
+      - [theta_ref, led_ticker]           # 图 1：两个符号同图共 Y 轴（图例列出两者）
+      - [ENC_1_POS_SENSOR.position]       # 图 2
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `interval_ms` | 否 | `20` | 采样周期（毫秒，≈50 Hz）。只读字段字节、SWD 流量小，可放心用比 watch 更快的节拍；采样期间不暂停 CPU |
+| `window_secs` | 否 | `5` | 滚动窗口宽度（秒），+/− 键运行时调整 |
+| `groups` | **是** | — | 图组列表：组内符号同图共 Y 轴，多组上下叠放、共享 X 轴联动 |
+
+- 只支持**标量**符号；复合类型报错并提示写成员路径（如 `s.member`）
+- 同一符号可出现在多个图组（只采样一次）
+- 组内量纲差异大时小信号会被压扁——同图请放量纲相近的符号，
+  量纲不同的分到不同图组
+- 运行 `tscope plot`（不带配置名）可列出全部曲线配置
+
 ---
 
 # 五、使用
@@ -371,6 +408,12 @@ tscope --config /path/to/tscope.yaml var theta_ref
 # 实时监视（Keil Watch 风格，q / Esc / Ctrl-C 退出）
 tscope watch                    # 列出配置里定义的所有监视组
 tscope watch watch1             # 打开 watch1 组的实时刷新表格
+
+# 实时曲线（独立 GUI 窗口；关窗退出）
+tscope plot                     # 列出配置里定义的所有曲线配置
+tscope plot plot1               # 打开 plot1 曲线窗口（图组叠放、共享 X）
+# 窗口内：滚轮缩放 / 左拖平移 / 右键框选 / 双击复位并恢复滚动
+#         空格暂停  +/− 窗口  r 恢复滚动  s 导出 CSV（当前目录）
 
 # 烧录固件（firmware.elf → 芯片 flash）
 tscope flash                    # 默认：扇区擦除 + 烧写 + 校验（终端里显示进度条）
@@ -442,7 +485,9 @@ watch 表格四列：表达式 / 值 / 类型 / 地址。值发生变化的行�
   ✅ `flash` 烧录（扇区擦除默认 + 校验，`--erase_all` 整片擦除带交互确认）；
   ⏳ 调试会话内查看局部变量；`chip.pack` 存在时自动调 target-gen
 - v4：固件侧 RTT 通道，`watch` 数据源升级为 RTT（高带宽）
-- v5：GUI（波形显示）
+- v5：✅ GUI 曲线窗口基础版（`plot` 子命令：eframe + egui_plot，图组叠放、
+  共享 X 联动、缩放/平移/框选/暂停/CSV 导出；`crates/tscope-plot` 独立库）；
+  ⏳ 增强：RTT 高带宽采样、SVG 截图导出、窗口布局保存
 
 ## 参考资料
 

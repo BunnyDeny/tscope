@@ -31,6 +31,9 @@ pub struct ToolConfig {
     /// 实时监视组：键是组名（`tscope watch <组名>` 的参数），可定义多组
     #[serde(default)]
     pub watch: BTreeMap<String, WatchGroup>,
+    /// 曲线显示配置：键是配置名（`tscope plot <配置名>` 的参数），可定义多个
+    #[serde(default)]
+    pub plot: BTreeMap<String, PlotConfig>,
 }
 
 /// 一个监视组：一组符号 + 采样周期
@@ -45,6 +48,30 @@ pub struct WatchGroup {
     pub max_elems: usize,
     /// 要监视的符号表达式列表（语法与 var 子命令相同，支持成员路径）
     pub symbols: Vec<String>,
+}
+
+/// 一个曲线配置：采样参数 + 图组划分（GUI 窗口，见 crates/tscope-plot）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlotConfig {
+    /// 采样周期（毫秒）。曲线用 20 ms 默认（≈50 Hz，滚动观感接近平滑；
+    /// 比 watch 的 100 ms 快，因为 plot 只读字段字节、SWD 流量小）
+    #[serde(default = "default_plot_interval_ms")]
+    pub interval_ms: u64,
+    /// 滚动窗口宽度（秒）：窗口内实时显示最近这么长时间的数据
+    #[serde(default = "default_plot_window_secs")]
+    pub window_secs: f64,
+    /// 图组：每个元素 = 一个子图；组内符号**同图共 Y 轴**（图例列出组内符号），
+    /// 多个组上下叠放、**共享 X 轴联动**。同一符号可出现在多个图（只采样一次）
+    pub groups: Vec<Vec<String>>,
+}
+
+fn default_plot_window_secs() -> f64 {
+    5.0
+}
+
+fn default_plot_interval_ms() -> u64 {
+    20
 }
 
 fn default_interval_ms() -> u64 {
@@ -169,6 +196,33 @@ impl ToolConfig {
             for sym in &w.symbols {
                 if sym.trim().is_empty() {
                     bail!("watch 组 {group} 里有空的符号表达式");
+                }
+            }
+        }
+        for (name, p) in &config.plot {
+            if name.trim().is_empty() {
+                bail!("plot 配置名不能为空");
+            }
+            if p.interval_ms == 0 {
+                bail!("plot 配置 {name} 的 interval_ms 不能为 0");
+            }
+            if p.window_secs <= 0.0 || !p.window_secs.is_finite() {
+                bail!("plot 配置 {name} 的 window_secs 必须为正数");
+            }
+            if p.groups.is_empty() {
+                bail!("plot 配置 {name} 的 groups 不能为空（至少一个图）");
+            }
+            for (i, g) in p.groups.iter().enumerate() {
+                if g.is_empty() {
+                    bail!(
+                        "plot 配置 {name} 的第 {} 个图为空（每个图至少要有一个符号）",
+                        i + 1
+                    );
+                }
+                for sym in g {
+                    if sym.trim().is_empty() {
+                        bail!("plot 配置 {name} 里有空的符号表达式");
+                    }
                 }
             }
         }

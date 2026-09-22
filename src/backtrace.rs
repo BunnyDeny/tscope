@@ -61,9 +61,7 @@ pub fn frame_return_address(elf_path: &Path, core: &mut Core) -> Option<u64> {
     match row.register(gimli::Register(14)) {
         Some(RegisterRule::Undefined) => None,
         Some(RegisterRule::SameValue) | None => Some(lr),
-        Some(RegisterRule::Offset(o)) => {
-            read_u32(core, cfa.wrapping_add_signed(o)).map(u64::from)
-        }
+        Some(RegisterRule::Offset(o)) => read_u32(core, cfa.wrapping_add_signed(o)).map(u64::from),
         Some(RegisterRule::Register(r)) => regs.get(&r.0).copied(),
         Some(_) => None,
     }
@@ -94,8 +92,8 @@ fn read_core_registers(core: &mut Core) -> Result<HashMap<u16, u64>> {
     let table = core.registers();
     for reg in table.core_registers() {
         let dwarf_id = match reg.name() {
-            "R0" | "R1" | "R2" | "R3" | "R4" | "R5" | "R6" | "R7" | "R8" | "R9" | "R10"
-            | "R11" | "R12" => reg.name()[1..].parse::<u16>().ok(),
+            "R0" | "R1" | "R2" | "R3" | "R4" | "R5" | "R6" | "R7" | "R8" | "R9" | "R10" | "R11"
+            | "R12" => reg.name()[1..].parse::<u16>().ok(),
             "R13" | "SP" => Some(13),
             "R14" | "LR" | "RA" => Some(14),
             "R15" | "PC" => Some(15),
@@ -123,10 +121,7 @@ pub fn backtrace(elf_path: &Path, core: &mut Core, max_frames: usize) -> Result<
     let mut ctx = UnwindContext::new();
 
     let mut regs = read_core_registers(core)?;
-    let mut pc = *regs
-        .get(&15)
-        .context("读 PC 失败（内核是否已暂停？）")?
-        & !1;
+    let mut pc = *regs.get(&15).context("读 PC 失败（内核是否已暂停？）")? & !1;
     let mut lr = regs.get(&14).copied().unwrap_or(0);
 
     // 初始栈顶：读 SCB->VTOR（0xE000ED08）得到向量表地址，其第 0 个字即
@@ -148,14 +143,12 @@ pub fn backtrace(elf_path: &Path, core: &mut Core, max_frames: usize) -> Result<
         frames.push(Frame { pc });
 
         // ---- 找当前 PC 的展开行 ----
-        let fde = match debug_frame.fde_for_address(
-            &bases,
-            pc,
-            gimli::read::DebugFrame::cie_from_offset,
-        ) {
-            Ok(fde) => fde,
-            Err(_) => break, // 无展开信息（bootloader / 启动汇编 / 库代码）：断链
-        };
+        let fde =
+            match debug_frame.fde_for_address(&bases, pc, gimli::read::DebugFrame::cie_from_offset)
+            {
+                Ok(fde) => fde,
+                Err(_) => break, // 无展开信息（bootloader / 启动汇编 / 库代码）：断链
+            };
         let row = match fde.unwind_info_for_address(&debug_frame, &bases, &mut ctx, pc) {
             Ok(row) => row,
             Err(_) => break,

@@ -80,9 +80,9 @@ fn resolve_target(registry: &mut Registry, chip: &ChipConfig) -> Result<Target> 
             )
         })?;
 
-        registry.add_target_family_from_yaml(&yaml).with_context(|| {
-            format!("芯片描述文件解析失败：{}", desc_path.display())
-        })?;
+        registry
+            .add_target_family_from_yaml(&yaml)
+            .with_context(|| format!("芯片描述文件解析失败：{}", desc_path.display()))?;
 
         return registry.get_target_by_name(name).map_err(|e| match e {
             // 文件加载成功但里面没有这个变体名 —— 和「文件不存在」是两种病，分开报
@@ -137,9 +137,7 @@ fn unsupported_chip_help(name: &str, chip: &ChipConfig) -> anyhow::Error {
             pack.display()
         ));
     } else {
-        msg.push_str(
-            "\x20   target-gen pack <厂商DFP.pack 或 Keil 已解压目录> ./targets/\n",
-        );
+        msg.push_str("\x20   target-gen pack <厂商DFP.pack 或 Keil 已解压目录> ./targets/\n");
     }
     msg.push_str("\n   然后把生成文件的路径写进 chip.description。");
     anyhow!(msg)
@@ -201,12 +199,12 @@ fn select_probe<'a>(
         Some(sel) => probes
             .iter()
             .find(|p| {
-                sel.vid.map_or(true, |v| p.vendor_id == v)
-                    && sel.pid.map_or(true, |v| p.product_id == v)
+                sel.vid.is_none_or(|v| p.vendor_id == v)
+                    && sel.pid.is_none_or(|v| p.product_id == v)
                     && sel
                         .serial
                         .as_ref()
-                        .map_or(true, |s| p.serial_number.as_deref() == Some(s))
+                        .is_none_or(|s| p.serial_number.as_deref() == Some(s))
             })
             .ok_or_else(|| anyhow!("没有找到匹配 probe.selector 的探针（检查 vid/pid/serial）")),
     }
