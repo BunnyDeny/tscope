@@ -249,12 +249,26 @@ fn sampler_loop(
     interval: Duration,
     tx: mpsc::Sender<Sample>,
 ) {
-    let mut core = match session.core(0) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("采样线程 attach 内核失败：{e:#}");
-            return;
+    // 挂接带退避重试：Windows 上 J-Link 的 USB 传输偶发超时
+    // （环境问题，与工具逻辑无关），重试可显著提高成功率
+    let mut core_opt = None;
+    for attempt in 1..=5u32 {
+        match session.core(0) {
+            Ok(c) => {
+                core_opt = Some(c);
+                break;
+            }
+            Err(e) if attempt < 5 => {
+                eprintln!("采样线程挂接失败（第 {attempt}/5 次）：{e:#}，重试中…");
+                std::thread::sleep(Duration::from_millis(300 * u64::from(attempt)));
+            }
+            Err(e) => {
+                eprintln!("采样线程挂接失败（第 5/5 次）：{e:#}，放弃采样（曲线窗口将无数据）");
+            }
         }
+    }
+    let Some(mut core) = core_opt else {
+        return;
     };
     let start = Instant::now();
     let mut next = Instant::now();
