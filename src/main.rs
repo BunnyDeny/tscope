@@ -95,7 +95,11 @@ enum Cmd {
         #[arg(long)]
         watch: bool,
 
-        /// 采样周期（毫秒，仅 --watch 生效，默认 100）
+        /// 曲线模式：GUI 窗口显示该符号的实时曲线（仅标量；与 --watch 互斥）
+        #[arg(long)]
+        plot: bool,
+
+        /// 采样周期（毫秒，仅 --watch / --plot 生效，默认 100）
         #[arg(long, default_value_t = 100)]
         interval: u64,
     },
@@ -106,10 +110,9 @@ enum Cmd {
         group: Option<String>,
     },
 
-    /// 独立 GUI 窗口显示变量实时曲线（配置在 tscope.yaml 的 plot 节；
-    /// 滚轮缩放/拖拽平移/右键框选，双击/r 恢复滚动，空格暂停，+/− 窗口，s 导出 CSV）
+    /// 按 tscope.yaml 的 plot 节配置渲染变量实时曲线（GUI 窗口）
     Plot {
-        /// 曲线配置名（对应 tscope.yaml 里 plot 节的键）；省略则列出所有配置
+        /// 曲线配置名（plot 节的键）；省略则列出所有配置
         name: Option<String>,
     },
 
@@ -189,31 +192,47 @@ fn main() -> Result<()> {
             count,
             all,
             watch,
+            plot,
             interval,
         } => {
+            if plot && watch {
+                bail!("--plot 与 --watch 不能同时使用");
+            }
             let config = load_config(&cli.config)?;
             let elf = config
                 .firmware
                 .elf
                 .ok_or_else(|| anyhow::anyhow!("配置里没有 firmware.elf 路径，无法解析符号"))?;
-            let mut session = session::open_session(&config.probe, &config.chip)?;
-            if watch {
-                // 临时监视组：不必编辑 tscope.yaml，max_elems 复用 --count/--all
-                watch::run_adhoc(
-                    &mut session,
+            if plot {
+                // 曲线模式：单符号 GUI 窗口（自己开探针；复合类型会明确报错）
+                plot::run_adhoc(
+                    &config.probe,
+                    &config.chip,
                     &elf,
-                    &format!("var --watch [{symbol}]"),
-                    vec![symbol.clone()],
+                    &symbol,
                     interval,
-                    if all { usize::MAX } else { count },
+                    &format!("var --plot [{symbol}]"),
                 )
             } else {
-                let mut core = session.core(0)?;
-                let opts = symbol::FmtOptions {
-                    max_elems: if all { None } else { Some(count) },
-                    max_depth: 3,
-                };
-                symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+                let mut session = session::open_session(&config.probe, &config.chip)?;
+                if watch {
+                    // 临时监视组：不必编辑 tscope.yaml，max_elems 复用 --count/--all
+                    watch::run_adhoc(
+                        &mut session,
+                        &elf,
+                        &format!("var --watch [{symbol}]"),
+                        vec![symbol.clone()],
+                        interval,
+                        if all { usize::MAX } else { count },
+                    )
+                } else {
+                    let mut core = session.core(0)?;
+                    let opts = symbol::FmtOptions {
+                        max_elems: if all { None } else { Some(count) },
+                        max_depth: 3,
+                    };
+                    symbol::print_global_value(&elf, &symbol, &mut core, &opts)
+                }
             }
         }
         Cmd::Watch { group } => {

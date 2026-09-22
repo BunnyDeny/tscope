@@ -36,6 +36,8 @@ ENC_1_POS_SENSOR (positionStruct) = {
   - 指针成员只显示地址（`NULL` 显示 NULL），位域明确提示暂不支持
   - `--watch` 持续刷新单符号（watch 风格表格，不必编辑 tscope.yaml 的监视组），
     `--interval <ms>` 控制采样周期（默认 100）；复合类型展开上限复用 `--count` / `--all`
+  - `--plot` 曲线模式：GUI 窗口显示该符号的实时曲线（不必编辑 yaml；仅标量，
+    复合类型明确报错并提示写成员路径；与 `--watch` 互斥）
 - `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
   - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
   - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU
@@ -46,8 +48,9 @@ ENC_1_POS_SENSOR (positionStruct) = {
   - 滚动窗口（X 右缘 = 最新数据，J-Scope/VOFA+ 式）；只支持标量符号，复合类型请写成员路径
   - 鼠标：滚轮缩放（X/Y 同时、光标锚定）、左键拖拽平移、右键框选缩放、双击复位并恢复滚动；
     键盘：空格全局暂停、+/− 调窗口、r 恢复滚动、s 导出 CSV（当前目录）
+    （关闭方式：窗口 ✕ / Alt+F4；关窗后 debug 会话自动回到提示符）
   - 采样线程独占 probe-rs 会话经 mpsc 送入 UI（`crates/tscope-plot` 库，与主程序同仓库）；
-    同一符号出现在多个图时只采样一次
+    同一符号出现在多个图时只采样一次；debug 会话里 `plot` 命令复用会话（关窗回到提示符）
   - 采样率受 SWD 轮询限制（默认 20ms ≈ 50Hz，趋势监视够用）；高带宽需 RTT（见路线图）
 - `flash`：把 `firmware.elf` 烧录到芯片（probe-rs 内置烧写算法，终端里多阶段进度条）
   - 默认**扇区擦除**：只擦 ELF 覆盖的扇区，bootloader 不受影响；烧写后自动回读校验
@@ -402,6 +405,9 @@ tscope var ENC_1_POS_SENSOR.readAngleCmd         # 结构体成员
 tscope var items[0].v.x                          # 下标 + 嵌套成员
 tscope var matrix[1][2]                          # 多维下标
 
+# 单符号实时曲线（GUI 窗口；复合类型会报错提示写成员路径）
+tscope var theta_ref --plot --interval 20
+
 # 指定配置文件
 tscope --config /path/to/tscope.yaml var theta_ref
 
@@ -433,6 +439,7 @@ tscope debug                    # 进入提示符 "> "，输入 help 查看命�
 > reset                         # 复位并暂停在 main 开头（rst 同义；可指定函数）
 > var theta_ref                 # 一次性读全局变量
 > watch watch1                  # 全屏持续监视，q 返回提示符（会话不断；w watch1 同义）
+> plot plot1                    # GUI 曲线窗口（复用本会话）；关窗返回提示符，plot 不带参数列出配置
 > q                             # 退出会话
 ```
 

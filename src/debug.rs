@@ -17,6 +17,7 @@ use probe_rs::{Core, Session};
 
 use crate::backtrace;
 use crate::config::ToolConfig;
+use crate::plot;
 use crate::session;
 use crate::symbol;
 use crate::watch;
@@ -134,6 +135,23 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 Some(group) => watch::run_with_session(config, group, &mut session),
                 None => watch::list_groups(config),
             },
+            "plot" => {
+                // 曲线 GUI：复用当前会话（GUI 期间 REPL 阻塞，关窗后回到提示符）；
+                // 闭包包住 ? 与 return，避免误退出整个调试会话
+                (|| -> Result<()> {
+                    let Some(name) = arg else {
+                        plot::list_plots(config)?;
+                        return Ok(());
+                    };
+                    let cfg = plot::resolve_plot(config, name)?;
+                    let elf = config
+                        .firmware
+                        .elf
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("配置里没有 firmware.elf，plot 无法解析符号"))?;
+                    plot::run_with_session(&mut session, cfg, elf, &format!("debug plot [{name}]"))
+                })()
+            }
             other => {
                 println!("未知命令 {other}（help 查看命令列表）");
                 Ok(())
@@ -185,6 +203,8 @@ fn print_help() {
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
   watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
+  plot [配置名]      GUI 窗口显示曲线（复用本会话；不带参数列出所有配置）；
+                      关窗后返回提示符
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 
