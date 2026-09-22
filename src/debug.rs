@@ -138,17 +138,23 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 None => watch::list_groups(config),
             },
             "plot" => {
-                // 曲线 GUI：复用当前会话（GUI 期间 REPL 阻塞，关窗后回到提示符）；
-                // 闭包包住 ? 与 return，避免误退出整个调试会话
-                (|| -> Result<()> {
-                    let Some(name) = arg else {
-                        plot::list_plots(config)?;
-                        return Ok(());
-                    };
-                    let cfg = plot::resolve_plot(config, name)?;
-                    let elf = config.firmware_image()?;
-                    plot::run_with_session(&mut session, cfg, elf, &format!("debug plot [{name}]"))
-                })()
+                // 曲线 GUI。Windows 实测教训：复用调试会话跑 plot（重复挂接 +
+                // 跨线程共享 Session）会让 J-Link 的 WinUSB 传输失步（bulk read
+                // timed out，且粘死到重开进程）。改法：释放旧会话 → plot 走
+                // 独立路径（自开全新会话，两个平台都验证正常）→ 结束后重开会话。
+                // 重开失败视为致命（本会话终止），plot 自身的错误则照常只打印不退出。
+                drop(session);
+                let r = match arg {
+                    None => plot::list_plots(config),
+                    Some(n) => plot::run(config, n),
+                };
+                session = match session::open_session(&config.probe, &config.chip) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(e.context("plot 后重开调试会话失败（探针重连不上），本会话终止"));
+                    }
+                };
+                r
             }
             other => {
                 println!("未知命令 {other}（help 查看命令列表）");
@@ -201,8 +207,8 @@ fn print_help() {
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
   watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
-  plot [配置名]      GUI 窗口显示曲线（复用本会话；不带参数列出所有配置）；
-                      关窗后返回提示符
+  plot [配置名]      GUI 窗口显示曲线（执行时探针短暂重连；不带参数
+                      列出所有配置）；关窗后返回提示符
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 

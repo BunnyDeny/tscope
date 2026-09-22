@@ -6,8 +6,9 @@
 //! 三个入口：
 //! - [`run`]：独立子命令，自己打开探针；
 //! - [`run_adhoc`]：`var --plot` 的单符号临时曲线，自己打开探针；
-//! - [`run_with_session`]：debug 会话里的 `plot` 命令，复用现有会话
-//!   （GUI 期间 REPL 阻塞，关窗后 Session 完好归还）。
+//! - [`run_with_session`]：给定会话启动曲线（run / run_adhoc 内部使用；
+//!   Windows 实测教训——debug 会话不能复用它，重复挂接会让 J-Link 的
+//!   WinUSB 传输失步，debug 里的 plot 改走 run() 独立路径）。
 //!
 //! 架构：采样线程独占 probe-rs Session（Session 非 Sync），按周期读符号
 //! 数值经 mpsc 送出；UI 侧用 tscope_plot::ChannelSource 包装，PlotApp 只认
@@ -90,9 +91,10 @@ pub fn run_adhoc(
     run_with_session(&mut session, &cfg, elf, title)
 }
 
-/// 复用已有调试会话启动曲线 GUI（debug 的 plot 命令用）。
-/// GUI 期间调用方（REPL）阻塞；窗口关闭后 scope 结束，采样线程退出，
-/// Session 完好归还调用方。
+/// 在给定会话上启动曲线 GUI（run / run_adhoc 内部使用：先开自己的
+/// 全新会话再传入）。GUI 期间调用方阻塞；窗口关闭后 scope 结束、
+/// 采样线程退出，会话完好。**不要**在 debug 会话里复用（Windows 上
+/// J-Link 会 bulk read 失步），debug 的 plot 走 run() 独立路径。
 pub fn run_with_session(
     session: &mut Session,
     cfg: &PlotConfig,
