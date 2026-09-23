@@ -114,6 +114,12 @@ enum Cmd {
     Plot {
         /// 曲线配置名（plot 节的键）；省略则列出所有配置
         name: Option<String>,
+
+        /// 隐藏的馈送模式：GUI 只消费 stdin 馈送、不碰探针。
+        /// debug 会话把曲线窗口派生成本独立子进程来跑
+        /// （winit 每进程只允许一个 EventLoop，子进程让关窗后重开可行）
+        #[arg(long, hide = true)]
+        feed: bool,
     },
 
     /// 烧录固件镜像（firmware.elf / .axf）到芯片（默认扇区擦除 + 校验，不复位）
@@ -239,11 +245,16 @@ fn main() -> Result<()> {
                 None => watch::list_groups(&config),
             }
         }
-        Cmd::Plot { name } => {
-            let config = load_config(&cli.config)?;
-            match name {
-                Some(n) => plot::run(&config, &n),
-                None => plot::list_plots(&config),
+        Cmd::Plot { name, feed } => {
+            if feed {
+                // 隐藏模式：只消费 stdin 馈送，不加载配置、不开探针
+                plot::run_feed()
+            } else {
+                let config = load_config(&cli.config)?;
+                match name {
+                    Some(n) => plot::run(&config, &n),
+                    None => plot::list_plots(&config),
+                }
             }
         }
         Cmd::Flash { erase_all, yes } => {

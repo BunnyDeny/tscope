@@ -10,14 +10,15 @@
 //! - halt/step/regs/pc 在运行时会自动先暂停内核并提示，暂停后保持（run 恢复）；
 //! - 所有操作只动 CPU 调试逻辑，不碰 flash（bootloader 安全）；
 //! - `plot` 曲线窗口异步运行：探针唯一属主是 REPL 主循环（rustyline 输入
-//!   在独立线程），GUI 线程纯消费数据；曲线滚动/暂停只跟随内核运行状态。
+//!   在独立线程），GUI 跑在派生的 `plot --feed` 子进程里纯消费数据
+//!   （winit 每进程只允许一个 EventLoop，子进程方案让关窗后重开可用）；
+//!   曲线滚动/暂停只跟随内核运行状态。
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use probe_rs::{Core, Session};
-use tscope_plot::{run_app, ChannelSource, PlotApp, PlotOptions, Sample};
 
 use crate::backtrace;
 use crate::config::ToolConfig;
@@ -33,11 +34,12 @@ const HALT_TIMEOUT: Duration = Duration::from_millis(1000);
 const BP_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// debug 会话内 plot 窗口的连接：主循环是**探针唯一属主**，
-/// 采样数据经 tx 发给 GUI 线程（GUI 纯消费）；内核状态变化经 ctrl
-/// 通知暂停/恢复——图像滚动与否只跟随内核运行状态。
+/// 采样数据经子进程 stdin 发给 GUI 进程（`plot --feed`，纯消费）；
+/// 内核状态变化也走同一管道通知暂停/恢复——图像滚动与否只跟随内核运行状态。
 struct PlotLink {
-    tx: mpsc::Sender<Sample>,
-    ctrl: mpsc::Sender<bool>,
+    /// 曲线窗口子进程（GUI 必须独立进程：winit 每进程只允许一个
+    /// EventLoop，同进程关窗后无法再开新窗）
+    feed: plot::FeedChild,
     /// 去重后的符号解析结果（只读字段字节）
     prepared: Vec<PreparedSymbol>,
     /// 通道顺序 → prepared 下标
@@ -47,10 +49,9 @@ struct PlotLink {
     started: Instant,
     /// 上次采样时的内核运行状态（用于暂停/恢复标记去重）
     was_running: Option<bool>,
-    /// GUI 线程关窗后的"已关闭"通知（内核暂停时不发数据，
-    /// 靠 tx.send 失败检测不到关窗——必须显式通知）
-    closed_rx: mpsc::Receiver<()>,
     window_open: bool,
+    /// 子进程退出状态（区分正常关窗/异常退出）
+    exit_status: Option<std::process::ExitStatus>,
 }
 
 /// 采样一个节拍（`running` 由调用方判定）：状态变化发暂停标记；
@@ -58,7 +59,7 @@ struct PlotLink {
 fn plot_sample(core: &mut Core, link: &mut PlotLink, running: bool) -> bool {
     if link.was_running != Some(running) {
         link.was_running = Some(running);
-        let _ = link.ctrl.send(!running); // true = 暂停
+        link.feed.write_pause(!running); // true = 暂停
     }
     if !running {
         return link.window_open;
@@ -74,10 +75,10 @@ fn plot_sample(core: &mut Core, link: &mut PlotLink, running: bool) -> bool {
                 .unwrap_or(f64::NAN)
         })
         .collect();
-    let values = link.chan_of.iter().map(|&i| vals[i]).collect();
-    if link.tx.send(Sample { t, values }).is_err() {
-        link.window_open = false; // GUI 已关闭
-    }
+    let values: Vec<f64> = link.chan_of.iter().map(|&i| vals[i]).collect();
+    // 写入失败（子进程已退出）静默忽略：关窗检测统一走 FeedChild::poll_exit
+    // （内核暂停时不发数据，靠写失败检测不到关窗）
+    link.feed.write_sample(t, &values);
     link.window_open
 }
 
@@ -97,8 +98,9 @@ fn plot_tick(session: &mut Session, link: &mut PlotLink) {
 ///
 /// 架构（plot 异步化的关键）：**探针唯一属主**——Session 只被主循环
 /// 一个线程持有。rustyline 输入跑在独立线程，命令经 mpsc 送达主循环；
-/// plot 窗口跑在 GUI 线程、纯消费数据。图像滚动与否只跟随内核运行状态
-/// （主循环每个采样节拍读 DHCSR 判定），与命令阻塞与否无关。
+/// plot 窗口跑在派生的 `plot --feed` 子进程、纯消费数据（winit 每进程
+/// 只允许一个 EventLoop，子进程方案让关窗后重开可行）。图像滚动与否
+/// 只跟随内核运行状态（主循环每个采样节拍读 DHCSR 判定），与命令阻塞无关。
 pub fn run(config: &ToolConfig) -> Result<()> {
     let elf = config.firmware_image().ok().map(|p| p.to_path_buf());
     let mut session = session::open_session(&config.probe, &config.chip)?;
@@ -275,8 +277,10 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                         }
                     }
                     "plot" => {
-                        // 曲线窗口异步打开：GUI 线程纯消费数据，主循环继续响应命令；
-                        // 采样由主循环按内核运行状态驱动（见 plot_tick / plot_sample）
+                        // 曲线窗口异步打开：GUI 跑在派生的 plot --feed 子进程
+                        // （winit 每进程只允许一个 EventLoop，子进程让关窗后
+                        // 重开成为可能），主循环继续响应命令；采样由主循环按
+                        // 内核运行状态驱动（见 plot_tick / plot_sample）
                         (|| -> Result<()> {
                             let Some(name) = arg else {
                                 plot::list_plots(config)?;
@@ -286,57 +290,26 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                                 bail!("已有曲线窗口打开（一次只支持一个）；关闭后再试");
                             }
                             let prep = plot::prepare_plot(config, name)?;
-                            let (tx, data_rx) = mpsc::channel::<Sample>();
-                            let (ctrl_tx, ctrl_rx) = mpsc::channel::<bool>();
-                            let (closed_tx, closed_rx) = mpsc::channel::<()>();
-                            let ordered = prep.ordered.clone();
-                            let groups = prep.groups_idx.clone();
-                            let window_secs = prep.window_secs;
-                            let title = format!("debug plot [{name}]");
-                            std::thread::Builder::new()
-                                .name("tscope-plot-gui".into())
-                                .spawn(move || {
-                                    // 关窗后（或启动失败时）无论哪条路径退出都发关闭通知，
-                                    // 主循环据此清理 plot_ctx——内核暂停时采样不发数据，
-                                    // 不能依赖 tx.send 失败来检测关窗
-                                    let closed = closed_tx;
-                                    let source = ChannelSource::new(data_rx, ordered);
-                                    let mut app = match PlotApp::new(
-                                        Box::new(source),
-                                        PlotOptions {
-                                            window_secs,
-                                            groups,
-                                            ..Default::default()
-                                        },
-                                    ) {
-                                        Ok(a) => a,
-                                        Err(e) => {
-                                            eprintln!("曲线配置错误：{e}");
-                                            let _ = closed.send(());
-                                            return;
-                                        }
-                                    };
-                                    // 外部暂停模式：空格键失效，跟随内核状态
-                                    app.set_external_pause(ctrl_rx);
-                                    if let Err(e) = run_app(app, &title) {
-                                        eprintln!("曲线窗口线程运行失败：{e}");
-                                    }
-                                    let _ = closed.send(());
-                                })
-                                .context("创建曲线窗口线程失败")?;
+                            let mut feed =
+                                plot::spawn_feed_child(&prep, &format!("debug plot [{name}]"))?;
+                            // 子进程若立刻退出（无显示环境/窗口初始化失败），
+                            // 别急着报"已打开"——错误细节已由子进程打到 stderr
+                            std::thread::sleep(Duration::from_millis(200));
+                            if let Some(st) = feed.poll_exit() {
+                                bail!("曲线窗口子进程已退出（{st}），打开失败；详见上方输出");
+                            }
                             plot_ctx = Some(PlotLink {
-                                tx,
-                                ctrl: ctrl_tx,
+                                feed,
                                 prepared: prep.prepared,
                                 chan_of: prep.chan_of,
                                 interval: Duration::from_millis(prep.interval_ms.max(10)),
                                 next_tick: Instant::now(),
                                 started: Instant::now(),
                                 was_running: None,
-                                closed_rx,
                                 window_open: true,
+                                exit_status: None,
                             });
-                            println!("曲线窗口已打开（异步）：REPL 可继续输入命令；曲线滚动跟随内核运行状态；关窗自动停止");
+                            println!("曲线窗口已打开（异步）：REPL 可继续输入命令；曲线滚动跟随内核运行状态；关窗后可再次打开");
                             Ok(())
                         })()
                     }
@@ -360,17 +333,28 @@ pub fn run(config: &ToolConfig) -> Result<()> {
 
         // —— 采样节拍：内核状态驱动（空闲与阻塞命令内都会走到） ——
         if let Some(link) = plot_ctx.as_mut() {
-            // GUI 线程的关窗通知优先于数据通道检测（内核暂停时后者失效）
-            if link.closed_rx.try_recv().is_ok() {
+            // 子进程退出（用户关窗/窗口异常）就是关闭通知：内核暂停时
+            // 采样不发数据，不能靠写失败检测关窗——必须轮询子进程状态
+            if let Some(st) = link.feed.poll_exit() {
                 link.window_open = false;
+                link.exit_status = Some(st);
             }
             if link.window_open {
                 plot_tick(&mut session, link);
             } else {
-                println!("曲线窗口已关闭，停止采样");
-                plot_ctx = None; // 清理连接
+                match &link.exit_status {
+                    Some(st) if st.success() => println!("曲线窗口已关闭，停止采样"),
+                    Some(st) => println!("曲线窗口异常退出（{st}），停止采样"),
+                    None => println!("曲线窗口已关闭，停止采样"),
+                }
+                plot_ctx = None; // 清理连接（之后可重新 plot 开新窗）
             }
         }
+    }
+
+    // 退出会话：收掉可能还开着的曲线窗口子进程（不留无主窗口）
+    if let Some(mut link) = plot_ctx.take() {
+        link.feed.kill();
     }
 
     println!("已退出调试会话");
@@ -409,7 +393,7 @@ fn print_help() {
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
   watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
   plot [配置名]      GUI 窗口显示曲线（异步：不阻塞命令输入，曲线滚动跟随
-                      内核运行状态；与 watch 互斥；不带参数列出所有配置）
+                      内核运行状态；与 watch 互斥；关窗后可再开；不带参数列出所有配置）
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 

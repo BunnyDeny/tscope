@@ -118,19 +118,32 @@ pub struct PlotApp {
     /// UI 墙钟起点：滚动窗口跟墙钟走（60fps 连续滑动），
     /// 不跟数据时间走（否则低采样率下窗口按采样周期跳步，看起来卡）
     started: Instant,
-    /// 暂停时刻：暂停期间冻结墙钟（曲线不滑出窗口）
-    paused_since: Option<Instant>,
+    /// 暂停瞬间的墙钟值（f64）：暂停期间墙钟冻结在此值。
+    /// 注意不能用 Instant + elapsed()——elapsed 在暂停期间照样增长
+    paused_at: Option<f64>,
     /// 外部暂停通道（debug 会话内嵌 plot 用）：暂停/恢复由外部消息驱动，
     /// 空格键失效——图像滚动与否只跟随内核运行状态
     external_pause: Option<mpsc::Receiver<bool>>,
 }
 
 impl PlotApp {
-    /// 当前墙钟时刻（秒）；暂停时冻结在暂停瞬间
+    /// 当前墙钟时刻（秒）；暂停时冻结在暂停瞬间的值
     fn wall_now(&self) -> f64 {
-        match self.paused_since {
-            Some(t) => t.elapsed().as_secs_f64(),
-            None => self.started.elapsed().as_secs_f64(),
+        self.paused_at
+            .unwrap_or_else(|| self.started.elapsed().as_secs_f64())
+    }
+
+    /// 统一的暂停切换：冻结/恢复墙钟 + 恢复时补 NaN 断点
+    fn set_paused(&mut self, p: bool) {
+        if p == self.paused {
+            return;
+        }
+        self.paused = p;
+        if p {
+            self.paused_at = Some(self.started.elapsed().as_secs_f64());
+        } else {
+            self.paused_at = None;
+            self.pending_gap = true;
         }
     }
 
@@ -184,7 +197,7 @@ impl PlotApp {
             last_title: String::new(),
             inner_size: options.inner_size,
             started: Instant::now(),
-            paused_since: None,
+            paused_at: None,
             external_pause: None,
         })
     }
@@ -219,16 +232,9 @@ impl PlotApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             if self.external_pause.is_none() && i.key_pressed(egui::Key::Space) {
-                self.paused = !self.paused;
                 // 通知数据源暂停/恢复产出（硬件源可停止读芯片）
-                self.source.set_paused(self.paused);
-                if self.paused {
-                    // 冻结墙钟：暂停期间窗口不继续滑动，曲线停在原地
-                    self.paused_since = Some(Instant::now());
-                } else {
-                    self.paused_since = None;
-                    self.pending_gap = true;
-                }
+                self.source.set_paused(!self.paused);
+                self.set_paused(!self.paused);
             }
             if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
                 self.window_secs = (self.window_secs + WINDOW_STEP_SECS).min(MAX_WINDOW_SECS);
@@ -391,18 +397,12 @@ impl eframe::App for PlotApp {
     /// 每帧先于绘制调用（窗口隐藏时也会调用）：拉数据、处理键盘、更新标题。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 外部暂停模式：跟随内核运行状态（恢复时补 NaN 断点）
-        if let Some(rx) = &self.external_pause {
-            while let Ok(p) = rx.try_recv() {
-                if p != self.paused {
-                    self.paused = p;
-                    if p {
-                        self.paused_since = Some(Instant::now());
-                    } else {
-                        self.paused_since = None;
-                        self.pending_gap = true;
-                    }
-                }
-            }
+        let msgs: Vec<bool> = match &self.external_pause {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for p in msgs {
+            self.set_paused(p);
         }
         // 拉取数据：暂停时照常排空数据源（防通道积压），但不进入曲线
         let batch = self.source.poll();
@@ -719,9 +719,13 @@ mod window_tests {
         assert_eq!(window.len(), 2, "window: {window:?}");
         assert_eq!(window[0], (3.0, 4.0));
         assert_eq!(full.len(), 5);
-        // 暂停冻结墙钟：paused_since 设置后 wall_now 不再前进
-        app.paused_since = Some(Instant::now() - Duration::from_secs(2));
+        // 暂停冻结墙钟：paused_at 存的是暂停瞬间的墙钟值，之后不再前进
+        app.paused_at = Some(2.0);
+        std::thread::sleep(Duration::from_millis(50));
         let frozen = app.wall_now();
-        assert!((frozen - 2.0).abs() < 0.05, "frozen={frozen}");
+        assert!(
+            (frozen - 2.0).abs() < 1e-9,
+            "暂停后墙钟仍在走：frozen={frozen}"
+        );
     }
 }
