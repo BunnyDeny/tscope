@@ -29,10 +29,9 @@ chip:
 
 firmware:
   # 固件镜像：var / watch / plot / flash 从这里解析符号与烧录。
-  # elf 与 axf 可同时配置：程序优先用「存在的」elf，回退 axf ——
-  # 同一份 yaml 在 Linux（GCC 的 .elf）与 Windows（Keil 的 .axf）通用
+  # elf 与 axf 可同时配置：程序优先用「存在的」elf，回退 axf
   elf: ../uni_software/bsp/gd/build/Project.elf
-  # axf: ../keil/Objects/project.axf   # Keil 产物路径（Windows 侧按实际填写）
+  # axf: ../keil/Objects/project.axf   # Keil 产物路径（如有）
 
 # ---------------------------------------------------------------------------
 # 实时监视组（tscope watch <组名>，Keil Watch 风格）

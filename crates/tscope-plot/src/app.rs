@@ -27,6 +27,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -119,6 +120,9 @@ pub struct PlotApp {
     started: Instant,
     /// 暂停时刻：暂停期间冻结墙钟（曲线不滑出窗口）
     paused_since: Option<Instant>,
+    /// 外部暂停通道（debug 会话内嵌 plot 用）：暂停/恢复由外部消息驱动，
+    /// 空格键失效——图像滚动与否只跟随内核运行状态
+    external_pause: Option<mpsc::Receiver<bool>>,
 }
 
 impl PlotApp {
@@ -181,7 +185,13 @@ impl PlotApp {
             inner_size: options.inner_size,
             started: Instant::now(),
             paused_since: None,
+            external_pause: None,
         })
+    }
+
+    /// 启用外部暂停模式：暂停/恢复由传入通道驱动，空格键失效。
+    pub fn set_external_pause(&mut self, rx: mpsc::Receiver<bool>) {
+        self.external_pause = Some(rx);
     }
 
     /// 追加一批样本到所有通道的历史（NaN 保持，作为断点）
@@ -208,7 +218,7 @@ impl PlotApp {
     /// 键盘处理：空格暂停、+/− 窗口、r 恢复滚动、s 导出 CSV
     fn handle_keys(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
-            if i.key_pressed(egui::Key::Space) {
+            if self.external_pause.is_none() && i.key_pressed(egui::Key::Space) {
                 self.paused = !self.paused;
                 // 通知数据源暂停/恢复产出（硬件源可停止读芯片）
                 self.source.set_paused(self.paused);
@@ -348,10 +358,19 @@ impl PlotApp {
 
     /// 标题栏：模式（滚动/冻结/暂停）+ 窗口宽度 + 状态消息
     fn update_title(&mut self, ctx: &egui::Context) {
+        let external = self.external_pause.is_some();
         let mode = if self.paused {
-            "⏸ 已暂停（空格继续）"
+            if external {
+                "⏸ 内核已暂停（跟随调试器）"
+            } else {
+                "⏸ 已暂停（空格继续）"
+            }
         } else if self.follow {
-            "▶ 滚动中"
+            if external {
+                "▶ 内核运行中"
+            } else {
+                "▶ 滚动中"
+            }
         } else {
             "⏸ 视图已冻结（双击/r 恢复滚动）"
         };
@@ -371,6 +390,20 @@ impl PlotApp {
 impl eframe::App for PlotApp {
     /// 每帧先于绘制调用（窗口隐藏时也会调用）：拉数据、处理键盘、更新标题。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 外部暂停模式：跟随内核运行状态（恢复时补 NaN 断点）
+        if let Some(rx) = &self.external_pause {
+            while let Ok(p) = rx.try_recv() {
+                if p != self.paused {
+                    self.paused = p;
+                    if p {
+                        self.paused_since = Some(Instant::now());
+                    } else {
+                        self.paused_since = None;
+                        self.pending_gap = true;
+                    }
+                }
+            }
+        }
         // 拉取数据：暂停时照常排空数据源（防通道积压），但不进入曲线
         let batch = self.source.poll();
         if !self.paused {
@@ -402,6 +435,18 @@ impl eframe::App for PlotApp {
 /// 启动 eframe 主循环（阻塞，直到窗口关闭）
 pub fn run_app(app: PlotApp, initial_title: &str) -> eframe::Result {
     let options = eframe::NativeOptions {
+        // Linux：允许在非主线程创建事件循环——debug 会话里 plot 窗口
+        // 异步运行（GUI 线程独立于 REPL 主循环）
+        event_loop_builder: Some(Box::new(|builder| {
+            #[cfg(target_os = "linux")]
+            {
+                // X11 与 Wayland 后端各自设置 any_thread（UFCS 避免同名方法歧义）
+                winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(builder, true);
+                winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+                    builder, true,
+                );
+            }
+        })),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(app.inner_size)
             .with_title(initial_title),

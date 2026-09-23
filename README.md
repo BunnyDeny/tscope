@@ -41,7 +41,7 @@ ENC_1_POS_SENSOR (positionStruct) = {
 - `watch`：Keil Watch 风格的实时刷新窗口（ratatui 交替屏表格，退出自动恢复终端）
   - 监视组定义在 `tscope.yaml` 的 `watch` 节，可定义多组（采样周期各自可调）
   - 值变化黄色高亮、读取失败红色显示，采样期间不暂停 CPU
-- `plot`：**独立 GUI 窗口**的实时变量曲线（eframe + egui_plot，跨平台 Windows/Linux/macOS）
+- `plot`：**独立 GUI 窗口**的实时变量曲线（eframe + egui_plot）
   - 曲线配置在 `tscope.yaml` 的 `plot` 节（结构类似 watch 组），`tscope plot <配置名>` 打开
   - **图组模型**：每个图组 = 一个子图，组内符号同图共 Y 轴（图例列出组内符号），
     多组上下叠放、**共享 X 轴联动**（任一图缩放/平移，全体 X 同步；Y 各自独立）
@@ -49,8 +49,12 @@ ENC_1_POS_SENSOR (positionStruct) = {
   - 鼠标：滚轮缩放（X/Y 同时、光标锚定）、左键拖拽平移、右键框选缩放、双击复位并恢复滚动；
     键盘：空格全局暂停、+/− 调窗口、r 恢复滚动、s 导出 CSV（当前目录）
     （关闭方式：窗口 ✕ / Alt+F4；关窗后 debug 会话自动回到提示符）
-  - 采样线程独占 probe-rs 会话经 mpsc 送入 UI（`crates/tscope-plot` 库，与主程序同仓库）；
-    同一符号出现在多个图时只采样一次；debug 会话里 `plot` 命令复用会话（关窗回到提示符）
+  - 独立路径（`tscope plot` / `var --plot`）：采样线程独占 probe-rs 会话经 mpsc 送入 UI；
+    同一符号出现在多个图时只采样一次
+  - **debug 会话里 `plot` 异步运行**：窗口打开后 REPL 继续可用（不阻塞命令输入），
+    探针唯一属主是调试主循环（数据源自 debug 程序，无共享会话竞争），
+    **曲线滚动/暂停只跟随内核运行状态**（内核跑→滚动，暂停→冻结，空格键失效）；
+    与 `watch` 互斥，一次一个窗口
   - 采样率受 SWD 轮询限制（默认 20ms ≈ 50Hz，趋势监视够用）；高带宽需 RTT（见路线图）
 - `flash`：把 `firmware.elf` 烧录到芯片（probe-rs 内置烧写算法，终端里多阶段进度条）
   - 默认**扇区擦除**：只擦 ELF 覆盖的扇区，bootloader 不受影响；烧写后自动回读校验
@@ -103,7 +107,7 @@ cargo build --release
 ```
 
 首次构建需下载并编译 probe-rs 及全部依赖（约 200 个 crate），耗时数分钟；
-之后增量构建秒级。产物：`target/release/tscope`（Windows 下为 `tscope.exe`）。
+之后增量构建秒级。产物：`target/release/tscope`。
 
 > 依赖版本：`Cargo.toml` 锁定 `probe-rs = "0.32"`，与工具开发时使用的
 > probe-rs 版本一致；上游发布破坏性变更时再显式升级。
@@ -116,13 +120,14 @@ cargo install --path .              # 安装到 ~/.cargo/bin/
 sudo cp target/release/tscope /usr/local/bin/
 ```
 
-## 3. 平台差异
+## 3. 平台定位
 
-| 平台 | 说明 |
-|---|---|
-| Linux | 构建后还需配置 **udev 规则**（见下节），否则普通用户打不开探针 |
-| Windows | 构建过程相同（PowerShell 里跑同样的命令）；J-Link 需要 **WinUSB 驱动**（见下节）。**想从 Linux 交叉编译零依赖单文件 exe？见 [docs/windows-exe.md](docs/windows-exe.md)** |
-| macOS | probe-rs 对 J-Link 原生支持，无需额外配置（未实测） |
+**本项目仅支持 Linux**，面向 Linux 嵌入式开发者。
+
+- Windows / macOS 不维护也不测试——Windows 实测中 J-Link 的 USB 传输
+  偶发 `bulk read timed out` 且粘死到重开进程（软件侧已尽力优化，
+  属驱动/固件环境问题），已放弃；Windows 开发者请用 Keil + J-Scope
+- 构建后需配置 **udev 规则**（见下节），否则普通用户打不开探针
 
 ---
 
@@ -170,34 +175,7 @@ tscope list
 
 ---
 
-# 三、Windows：J-Link 驱动切换
-
-**probe-rs 与 SEGGER 官方 Windows 驱动不兼容**（官方文档明确说明），
-必须把 J-Link 切换到通用 **WinUSB** 驱动。
-
-**方法 A（官方推荐）：J-Link Configurator**
-
-1. 下载 [J-Link Configurator](https://www.segger.com/products/debug-probes/j-link/tools/j-link-configurator/)
-2. 连接 J-Link，启动 Configurator
-3. 在设备列表中右键你的探针 → **Configure**
-4. **USB Driver (Windows)** 选择 **WinUSB** → OK
-
-**方法 B（A 的选项被禁用时）：Zadig**
-
-用 [Zadig](https://zadig.akeo.ie/) 为你的探针安装 WinUSB 驱动。
-
-> ⚠️ 切换到 WinUSB 后，SEGGER 官方工具（J-Flash、J-Link Commander 等）
-> 可能无法再识别该探针，需要时可切换回官方驱动。
-
-验证：
-
-```powershell
-.\target\release\tscope.exe list
-```
-
----
-
-# 四、配置 tscope.yaml
+# 三、配置 tscope.yaml
 
 tscope 的每次执行都由一个 YAML 配置文件驱动（默认 `./tscope.yaml`，
 可用 `--config` 指定）。配置只描述"环境"（探针、芯片、固件），
@@ -307,16 +285,16 @@ target-gen pack GigaDevice.GD32F50x_DFP.1.0.1.pack ./targets/
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `elf` | 二选一 | 固件镜像路径（GCC 产物，Linux 常用）。从其调试信息（DWARF）解析符号地址与类型 |
-| `axf` | 二选一 | Keil 产物路径（armclang/armcc 输出，**本质也是 ELF**，Windows 侧常用） |
+| `axf` | 二选一 | Keil 产物路径（armclang/armcc 输出，**本质也是 ELF**） |
 
 两个字段**可同时配置**：程序优先用「存在的」`elf`，不存在则回退 `axf`——
-同一份 `tscope.yaml` 在 Linux（.elf）与 Windows（.axf）两个平台通用，
-哪边编译的产物存在就用哪边。两者都不存在时报错并列出两条路径。
+例如项目在别的机器上由 Keil 构建、axf 拷贝过来时无需改配置。
+两者都不存在时报错并列出两条路径。
 
 ```yaml
 firmware:
-  elf: ../uni_software/bsp/gd/build/Project.elf   # Linux：GCC 产物
-  axf: ../keil/Objects/project.axf                # Windows：Keil 产物
+  elf: ../uni_software/bsp/gd/build/Project.elf   # GCC 产物
+  # axf: ../keil/Objects/project.axf              # Keil 产物（如有）
 ```
 
 **关键前提**：固件镜像必须与**板上实际烧录的固件**是同一次构建的产物。
@@ -388,7 +366,7 @@ plot:
 
 ---
 
-# 五、使用
+# 四、使用
 
 ```bash
 # 探针自检
@@ -450,7 +428,7 @@ tscope debug                    # 进入提示符 "> "，输入 help 查看命�
 > reset                         # 复位并暂停在 main 开头（rst 同义；可指定函数）
 > var theta_ref                 # 一次性读全局变量
 > watch watch1                  # 全屏持续监视，q 返回提示符（会话不断；w watch1 同义）
-> plot plot1                    # GUI 曲线窗口（复用本会话）；关窗返回提示符，plot 不带参数列出配置
+> plot plot1                    # GUI 曲线窗口（异步：REPL 继续可用，曲线跟随内核状态）；plot 不带参数列出配置
 > q                             # 退出会话
 ```
 
@@ -481,21 +459,20 @@ watch 表格四列：表达式 / 值 / 类型 / 地址。值发生变化的行�
 
 ---
 
-# 六、常见问题
+# 五、常见问题
 
 | 现象 | 排查 |
 |---|---|
-| `没有发现调试探针` | USB 连接；Linux 是否配好 udev 并**拔插过**；Windows 是否切了 WinUSB 驱动；探针是否被 VSCode 调试 / dap-server 占用 |
+| `没有发现调试探针` | USB 连接；是否配好 udev 并**拔插过**；探针是否被 VSCode 调试 / dap-server 占用 |
 | `打开探针 … 失败` / attach 报错 | 芯片是否上电；SWD 接线；`speed_khz` 是否 ≤ 1000 |
 | flash 后 `debug` 里 `run` 提示「内核正在运行（未暂停）」 | 正常现象：烧录后新固件已自动从头启动，直接用 `watch` / `var` 观察即可；要重新从头跑用 `rst` |
 | `在 ELF 里没有找到符号 xxx` | 拼写；是否局部变量（只支持全局/静态）；是否被 `-O2` 优化掉（`OPT=-O0` 重编）；ELF 与板上固件是否同一次构建 |
 | `符号 xxx 在 ELF 里存在，但读不出值：被编译器优化掉了` | 同上，`make OPT=-O0` 重编固件 |
 | `类型 … 里没有成员 xxx` / `下标 N 越界` | 成员名拼写 / 数组长度核对（`tscope var 数组名` 可看到长度） |
-| Windows 下 `probe-rs list` 能列但连不上 | 驱动不是 WinUSB（见第三节方法 B Zadig） |
 
 ---
 
-# 七、路线图
+# 六、路线图
 
 - v2：✅ ELF 符号解析（标量 / 数组 / 结构体 / 联合体 / 枚举，嵌套 + 成员路径）
 - v3：✅ `watch` 实时监视（ratatui 交替屏表格，多组，Keil 风格高亮）；
