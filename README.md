@@ -18,6 +18,42 @@ ENC_1_POS_SENSOR (positionStruct) = {
 }
 ```
 
+## 为什么不用 OpenOCD + GDB
+
+OpenOCD 体系调试一次要开两道工序：先 `openocd -f interface/... -f target/...` 起 server，
+再另开终端 `gdb-multiarch` 里 `target remote :3333`、`file xxx.elf`、`monitor reset halt`……
+每次换工程全部重来一遍。tscope 把这一切压进一个 yaml + 一条命令：
+
+```
+# OpenOCD + GDB：至少六道工序，两个进程、两套配置
+$ openocd -f interface/jlink.cfg -f target/gd32f5xx.cfg     # 终端 1：起 server
+$ gdb-multiarch                                             # 终端 2：起 gdb
+(gdb) target remote :3333
+(gdb) file build/Project.elf
+(gdb) monitor reset halt
+(gdb) b main                                                # 终于可以开始调了
+
+# tscope：一条命令直接进入调试状态
+$ tscope debug                                              # 探针/芯片/固件都在 tscope.yaml 里
+> bp main
+```
+
+**集成度是 tscope 的定位根基**，除此之外还有这些 OpenOCD 体系给不了的差异：
+
+- **`var` / `hexdump` 不暂停 CPU 读内存**：gdb 里 `p 变量` 必须目标 halted（停核 = 你的 PWM/电机控制中断），
+  tscope 基于 probe-rs 直接走总线读，内核照跑、照读变量——监视运行中的控制系统时这是致命差别
+- **符号感知的变量格式化**：`var ENC_1_POS_SENSOR.readAngleCmd` 直接给出值与类型，结构体/数组/枚举
+  按类型展开、成员路径随便写；gdb 得自己配 pretty-printer 才有类似观感
+- **watch / plot 可视化**：Keil Watch 风格持续刷新 + GUI 曲线窗口，OpenOCD 体系没有对等物
+- **工程化小坑全填平**：Keil `.axf` 行号表兼容、断点自动清 Thumb 位、芯片复位后断点自动恢复、
+  硬件断点满报错提示、flash 扇区擦除保护 bootloader——这些 gdb 里都要人肉踩一遍
+- **AI / 脚本友好**：单进程、单 REPL、会话输出干净可复读；OpenOCD+GDB 双进程隔着 telnet 协议难驱动得多
+- **部署轻**：一个二进制 + 一个 yaml，不用装 OpenOCD 和 gdb-multiarch 两套工具链
+
+诚实的边界：OpenOCD+GDB 在**深水区**仍占优——条件断点、数据断点（watchpoint）、trace（ETM/SWO）、
+RTOS 线程感知、多核，以及"搜到的答案全是 gdb 的"生态惯性。tscope 不是"另一个 gdb"，而是把
+**日常 90% 的调试动作压缩成一条命令 + 一个 yaml** 的专用工具：通用性比不过 gdb，日常效率 gdb 比不过它。
+
 ## 特性一览
 
 - `list`：列出本机调试探针（排查连接问题）
