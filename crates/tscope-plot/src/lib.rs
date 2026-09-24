@@ -1,6 +1,9 @@
-//! tscope-plot：tscope 曲线 GUI 的独立库。
+//! tscope-plot：tscope 的 GUI 库——曲线窗口（plot）与变量监视窗口（watch）。
 //!
-//! 与 tscope 主仓库解耦开发，验证成熟后整体并入 tscope。
+//! 两个窗口共用同一套 eframe 依赖与"数据驱动"设计：
+//! - 曲线窗口：`PlotApp` 消费「通道名 + (时刻, 数值) 流」（见下）；
+//! - 监视窗口：`WatchApp` 消费「变量名 + 格式化值文本」逐拍快照，
+//!   值变化整行黄色高亮（Keil Watch 风格，见 [`watch`]）。
 //!
 //! # 架构
 //!
@@ -41,6 +44,8 @@
 
 pub mod app;
 pub mod source;
+pub mod watch;
 
 pub use app::{run_app, PlotApp, PlotOptions};
 pub use source::{ChannelSource, DataSource, Sample, WaveSource, Waveform};
+pub use watch::{run_watch_app, WatchApp, WatchEntry};

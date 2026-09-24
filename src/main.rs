@@ -11,6 +11,7 @@
 mod backtrace;
 mod config;
 mod debug;
+mod feed;
 mod flash;
 mod hexdump;
 mod plot;
@@ -91,7 +92,7 @@ enum Cmd {
         #[arg(long)]
         all: bool,
 
-        /// 持续刷新显示（watch 风格表格；q/Esc 退出；展开上限由 --count / --all 控制）
+        /// 监视模式：GUI 窗口实时刷新该符号（展开上限由 --count / --all 控制）
         #[arg(long)]
         watch: bool,
 
@@ -104,10 +105,16 @@ enum Cmd {
         interval: u64,
     },
 
-    /// 实时刷新监视组（Keil Watch 风格；组定义在 tscope.yaml 的 watch 节）
+    /// 实时刷新监视组（Keil Watch 风格 GUI 窗口；组定义在 tscope.yaml 的 watch 节）
     Watch {
         /// 监视组名（对应 tscope.yaml 里 watch 节的键）；省略则列出所有组
         group: Option<String>,
+
+        /// 隐藏的馈送模式：GUI 只消费 stdin 馈送、不碰探针。
+        /// debug 会话把监视窗口派生成本独立子进程来跑
+        /// （winit 每进程只允许一个 EventLoop，子进程让关窗后重开可行）
+        #[arg(long, hide = true)]
+        feed: bool,
     },
 
     /// 按 tscope.yaml 的 plot 节配置渲染变量实时曲线（GUI 窗口）
@@ -238,11 +245,16 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Watch { group } => {
-            let config = load_config(&cli.config)?;
-            match group {
-                Some(g) => watch::run(&config, &g),
-                None => watch::list_groups(&config),
+        Cmd::Watch { group, feed } => {
+            if feed {
+                // 隐藏模式：只消费 stdin 馈送，不加载配置、不开探针
+                watch::run_watch_feed()
+            } else {
+                let config = load_config(&cli.config)?;
+                match group {
+                    Some(g) => watch::run(&config, &g),
+                    None => watch::list_groups(&config),
+                }
             }
         }
         Cmd::Plot { name, feed } => {

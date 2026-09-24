@@ -2,7 +2,7 @@
 name = "tscope-plot"
 version = "0.1.0"
 edition = "2021"
-description = "tscope 曲线 GUI 的最小演示：Rust 本地生成动态正弦波，验证 eframe + egui_plot 显示方案"
+description = "tscope 的 GUI 库：曲线窗口（plot，eframe + egui_plot）与变量监视窗口（watch，Keil Watch 风格表格）"
 
 [dependencies]
 eframe = "0.36"

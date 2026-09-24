@@ -34,7 +34,7 @@
 //! 不留无主空窗口。父端靠轮询子进程退出状态检测关窗——内核暂停时采样
 //! 不发数据，不能依赖写失败检测（会漏）。
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -356,69 +356,31 @@ pub fn run_feed() -> Result<()> {
 /// GUI 必须独立子进程：winit 每进程只允许一个 EventLoop，关窗后同进程
 /// 再开新窗必报 "EventLoop can't be recreated"——每次 plot 派生全新
 /// `plot --feed` 子进程，开/关/重开天然干净。
-pub struct FeedChild {
-    pub child: std::process::Child,
-    stdin: Option<BufWriter<std::process::ChildStdin>>,
-}
+pub type FeedChild = crate::feed::FeedChild;
 
 /// 派生 `plot --feed` 子进程并写入头部。样本/暂停随后经
-/// [`FeedChild::write_sample`] / [`FeedChild::write_pause`] 逐行馈送。
+/// [`feed_write_sample`] / [`feed_write_pause`] 逐行馈送。
 pub fn spawn_feed_child(prep: &PreparedPlot, title: &str) -> Result<FeedChild> {
-    let exe =
-        std::env::current_exe().context("取不到当前可执行文件路径（无法派生曲线窗口子进程）")?;
-    let mut child = std::process::Command::new(exe)
-        .args(["plot", "--feed"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("启动曲线窗口子进程失败")?;
-    let stdin = BufWriter::new(child.stdin.take().context("拿不到子进程 stdin 管道")?);
-    let mut feed = FeedChild {
-        child,
-        stdin: Some(stdin),
-    };
-    write_header(
-        feed.stdin.as_mut().expect("stdin 刚置为 Some"),
-        prep,
-        title,
-    )
-    .context("写子进程馈送头部失败")?;
+    let mut feed = FeedChild::spawn(&["plot", "--feed"]).context("启动曲线窗口子进程失败")?;
+    match feed.writer() {
+        Some(w) => write_header(w, prep, title).context("写子进程馈送头部失败")?,
+        None => bail!("曲线窗口子进程 stdin 不可用"),
+    }
     Ok(feed)
 }
 
-impl FeedChild {
-    /// 发暂停/恢复标记（true = 内核暂停 → 曲线冻结）
-    pub fn write_pause(&mut self, paused: bool) {
-        if let Some(w) = &mut self.stdin {
-            let _ = write_pause_line(w, paused);
-        }
+/// 发暂停/恢复标记（true = 内核暂停 → 曲线冻结）
+pub fn feed_write_pause(feed: &mut FeedChild, paused: bool) {
+    if let Some(w) = feed.writer() {
+        let _ = write_pause_line(w, paused);
     }
+}
 
-    /// 发一个样本。写入失败（子进程已退出）静默忽略——关窗检测统一走
-    /// [`FeedChild::poll_exit`]，内核暂停时不发数据也能可靠检测关窗
-    pub fn write_sample(&mut self, t: f64, values: &[f64]) {
-        if let Some(w) = &mut self.stdin {
-            let _ = write_sample_line(w, t, values);
-        }
-    }
-
-    /// 子进程是否已退出（用户关窗/窗口异常）。可重复调用。
-    pub fn poll_exit(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
-    }
-
-    /// 会话结束：先关写端让子进程经 stdin EOF 自行干净退出，
-    /// 短暂等待后仍未退出再强杀兜底（已退出的忽略错误）
-    pub fn kill(&mut self) {
-        self.stdin = None; // drop 写端 → 子进程读线程 EOF → exit(0)
-        for _ in 0..30 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+/// 发一个样本。写入失败（子进程已退出）静默忽略——关窗检测统一走
+/// [`FeedChild::poll_exit`]，内核暂停时不发数据也能可靠检测关窗
+pub fn feed_write_sample(feed: &mut FeedChild, t: f64, values: &[f64]) {
+    if let Some(w) = feed.writer() {
+        let _ = write_sample_line(w, t, values);
     }
 }
 

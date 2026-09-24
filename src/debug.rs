@@ -3,16 +3,16 @@
 //! 设计（与项目约定一致）：
 //! - 会话开始时 attach 一次，整个会话复用同一个 Session；
 //! - 每个命令独立执行、独立报错——单条命令出错**不会**退出会话；
-//! - `watch` 命令复用 watch 模块：进入交替屏持续显示，按 q 恢复终端
-//!   并回到提示符（会话与探针连接保持不变）；
+//! - `watch` 命令复用 watch 模块：异步 GUI 监视窗口（与 plot 同机制），
+//!   REPL 不阻塞，可边调试边观察变量；与 plot 窗口可同时打开；
 //! - `bp` 的断点地址可写十六进制或函数名（从 firmware.elf 符号表解析，
 //!   自动清 Thumb 位）；命中断点后打印 PC 与所在函数，并自动清除断点；
 //! - halt/step/regs/pc 在运行时会自动先暂停内核并提示，暂停后保持（run 恢复）；
 //! - 所有操作只动 CPU 调试逻辑，不碰 flash（bootloader 安全）；
-//! - `plot` 曲线窗口异步运行：探针唯一属主是 REPL 主循环（rustyline 输入
-//!   在独立线程），GUI 跑在派生的 `plot --feed` 子进程里纯消费数据
+//! - `plot` / `watch` 窗口异步运行：探针唯一属主是 REPL 主循环（rustyline
+//!   输入在独立线程），GUI 跑在派生的 `--feed` 子进程里纯消费数据
 //!   （winit 每进程只允许一个 EventLoop，子进程方案让关窗后重开可用）；
-//!   曲线滚动/暂停只跟随内核运行状态。
+//!   曲线滚动/暂停只跟随内核运行状态，watch 值每节拍采样不暂停内核。
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -59,7 +59,7 @@ struct PlotLink {
 fn plot_sample(core: &mut Core, link: &mut PlotLink, running: bool) -> bool {
     if link.was_running != Some(running) {
         link.was_running = Some(running);
-        link.feed.write_pause(!running); // true = 暂停
+        plot::feed_write_pause(&mut link.feed, !running); // true = 暂停
     }
     if !running {
         return link.window_open;
@@ -78,7 +78,7 @@ fn plot_sample(core: &mut Core, link: &mut PlotLink, running: bool) -> bool {
     let values: Vec<f64> = link.chan_of.iter().map(|&i| vals[i]).collect();
     // 写入失败（子进程已退出）静默忽略：关窗检测统一走 FeedChild::poll_exit
     // （内核暂停时不发数据，靠写失败检测不到关窗）
-    link.feed.write_sample(t, &values);
+    plot::feed_write_sample(&mut link.feed, t, &values);
     link.window_open
 }
 
@@ -94,6 +94,50 @@ fn plot_tick(session: &mut Session, link: &mut PlotLink) {
     }
 }
 
+/// debug 会话内 watch 窗口的连接：结构与 PlotLink 对称——
+/// 采样/格式化在主循环（探针唯一属主），值文本经子进程 stdin 馈送。
+struct WatchLink {
+    /// 监视窗口子进程（独立进程的原因同 plot）
+    feed: watch::FeedWatchChild,
+    /// 监视行（标签 + 解析结果 + 数组元素展开）
+    rows: Vec<watch::WatchRow>,
+    interval: Duration,
+    next_tick: Instant,
+    window_open: bool,
+    /// 子进程退出状态（区分正常关窗/异常退出）
+    exit_status: Option<std::process::ExitStatus>,
+}
+
+/// 采样一个 watch 节拍：读符号 → 格式化 → 变化行（首拍全行）发子进程。
+/// 内核运行/暂停都能读内存（值在暂停时自然不变），因此不需要状态标记。
+fn watch_sample(core: &mut Core, link: &mut WatchLink) {
+    // 采样后逐行对比上次已发送文本，变化才写管道
+    if watch::sample_rows_core(core, &mut link.rows).is_err() {
+        return; // 探针偶发错误：跳过本拍，保持旧值
+    }
+    for (i, row) in link.rows.iter_mut().enumerate() {
+        let text = row.display_text();
+        if row.last_sent.as_deref() != Some(text.as_str()) {
+            watch::feed_write_value(&mut link.feed, i, &text);
+            row.last_sent = Some(text);
+        }
+    }
+}
+
+/// 空闲节拍：自取内核后采样（主循环调用）
+fn watch_tick(session: &mut Session, link: &mut WatchLink) {
+    if Instant::now() < link.next_tick {
+        return;
+    }
+    link.next_tick += link.interval;
+    if let Ok(mut core) = session.core(0) {
+        watch_sample(&mut core, link);
+    }
+}
+
+/// 阻塞等待循环里同时驱动 plot/watch 采样用的双连接借用
+type LiveLinks<'a> = (Option<&'a mut PlotLink>, Option<&'a mut WatchLink>);
+
 /// 进入交互式调试会话。
 ///
 /// 架构（plot 异步化的关键）：**探针唯一属主**——Session 只被主循环
@@ -108,7 +152,8 @@ pub fn run(config: &ToolConfig) -> Result<()> {
     println!("tscope 调试会话已建立。输入 help 查看命令，q 退出。");
     println!("提示：halt/step/regs/pc 会自动暂停运行中的内核（暂停后保持，run 恢复运行）；bp 命中后内核保持暂停。");
     println!("行编辑：左右光标移动，↑/↓ 翻阅历史命令（跨会话保存）。");
-    println!("plot 曲线窗口异步运行：REPL 不阻塞，曲线滚动跟随内核运行状态；与 watch 互斥。");
+    println!("plot 曲线窗口异步运行：REPL 不阻塞，曲线滚动跟随内核运行状态；关窗后可再开。");
+    println!("watch 监视窗口异步运行：REPL 不阻塞，边调试边观察变量；与 plot 窗口可同时打开。");
 
     // —— 输入线程：rustyline 阻塞读，命令经 mpsc 送主循环 ——
     // 提示符握手：主循环处理完命令、输出完毕后才发令牌放行下一次读入，
@@ -169,10 +214,14 @@ pub fn run(config: &ToolConfig) -> Result<()> {
     let mut breakpoints: Vec<Breakpoint> = Vec::new();
     // 当前打开的曲线窗口连接（一次一个）
     let mut plot_ctx: Option<PlotLink> = None;
+    // 当前打开的监视窗口连接（一次一个；与 plot 可同时开）
+    let mut watch_ctx: Option<WatchLink> = None;
 
     loop {
-        // —— 取一条命令：无曲线窗口时阻塞等待；有则 10ms 超时轮询以保持采样 ——
-        let msg = if plot_ctx.as_ref().is_some_and(|l| l.window_open) {
+        // —— 取一条命令：无实时窗口时阻塞等待；有则 10ms 超时轮询以保持采样 ——
+        let any_window = plot_ctx.as_ref().is_some_and(|l| l.window_open)
+            || watch_ctx.as_ref().is_some_and(|l| l.window_open);
+        let msg = if any_window {
             match cmd_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(m) => Some(m),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -209,12 +258,14 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                     }
                     "halt" => debug_halt(&mut session),
                     "run" | "continue" | "c" => {
-                        debug_run(&mut session, elf.as_deref(), &breakpoints, plot_ctx.as_mut())
+                        let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
+                        debug_run(&mut session, elf.as_deref(), &breakpoints, live)
                     }
                     "step" | "s" | "next" | "n" => debug_step(&mut session, elf.as_deref()),
                     "stepi" | "si" => debug_stepi(&mut session, elf.as_deref()),
                     "finish" | "fin" | "f" => {
-                        debug_finish(&mut session, elf.as_deref(), plot_ctx.as_mut())
+                        let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
+                        debug_finish(&mut session, elf.as_deref(), live)
                     }
                     "regs" => debug_regs(&mut session),
                     "pc" => debug_pc(&mut session, elf.as_deref()),
@@ -234,7 +285,8 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                             let elf = elf.as_deref().ok_or_else(|| {
                                 anyhow!("reset 需要固件镜像（firmware.elf / firmware.axf）来解析函数地址（复位后暂停在函数开头）")
                             })?;
-                            debug_reset(&mut session, elf, target, &breakpoints, plot_ctx.as_mut())
+                            let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
+                            debug_reset(&mut session, elf, target, &breakpoints, live)
                         })()
                     }
                     "bp" => match arg {
@@ -267,13 +319,37 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                         })()
                     }
                     "watch" | "w" => {
-                        if plot_ctx.as_ref().is_some_and(|l| l.window_open) {
-                            Err(anyhow!("曲线窗口打开期间不支持 watch（两者互斥）；请先关闭曲线窗口"))
-                        } else {
-                            match arg {
-                                Some(group) => watch::run_with_session(config, group, &mut session),
-                                None => watch::list_groups(config),
-                            }
+                        // 监视窗口异步打开：GUI 跑在派生的 watch --feed 子进程
+                        // （机制同 plot），主循环继续响应命令；采样由主循环按
+                        // 节拍驱动（见 watch_tick / watch_sample），与 plot 可同时开
+                        match arg {
+                            Some(group) => (|| -> Result<()> {
+                                if watch_ctx.as_ref().is_some_and(|l| l.window_open) {
+                                    bail!("已有监视窗口打开（一次只支持一个）；关闭后再试");
+                                }
+                                let prep = watch::prepare_watch(config, group)?;
+                                let mut feed = watch::spawn_watch_feed_child(
+                                    &prep.labels(),
+                                    &format!("debug watch [{group}]"),
+                                )?;
+                                // 子进程若立刻退出（无显示环境/窗口初始化失败），
+                                // 别急着报"已打开"——错误细节已由子进程打到 stderr
+                                std::thread::sleep(Duration::from_millis(200));
+                                if let Some(st) = feed.poll_exit() {
+                                    bail!("监视窗口子进程已退出（{st}），打开失败；详见上方输出");
+                                }
+                                watch_ctx = Some(WatchLink {
+                                    feed,
+                                    rows: prep.rows,
+                                    interval: Duration::from_millis(prep.interval_ms.max(10)),
+                                    next_tick: Instant::now(),
+                                    window_open: true,
+                                    exit_status: None,
+                                });
+                                println!("监视窗口已打开（异步）：REPL 可继续输入命令；与 plot 窗口可同时打开；关窗后可再次打开");
+                                Ok(())
+                            })(),
+                            None => watch::list_groups(config),
                         }
                     }
                     "plot" => {
@@ -350,10 +426,30 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                 plot_ctx = None; // 清理连接（之后可重新 plot 开新窗）
             }
         }
+        // watch 窗口节拍：与 plot 完全对称，独立采样、独立关窗
+        if let Some(link) = watch_ctx.as_mut() {
+            if let Some(st) = link.feed.poll_exit() {
+                link.window_open = false;
+                link.exit_status = Some(st);
+            }
+            if link.window_open {
+                watch_tick(&mut session, link);
+            } else {
+                match &link.exit_status {
+                    Some(st) if st.success() => println!("监视窗口已关闭，停止采样"),
+                    Some(st) => println!("监视窗口异常退出（{st}），停止采样"),
+                    None => println!("监视窗口已关闭，停止采样"),
+                }
+                watch_ctx = None; // 清理连接（之后可重新 watch 开新窗）
+            }
+        }
     }
 
-    // 退出会话：收掉可能还开着的曲线窗口子进程（不留无主窗口）
+    // 退出会话：收掉可能还开着的窗口子进程（不留无主窗口）
     if let Some(mut link) = plot_ctx.take() {
+        link.feed.kill();
+    }
+    if let Some(mut link) = watch_ctx.take() {
         link.feed.kill();
     }
 
@@ -391,9 +487,10 @@ fn print_help() {
   bt [帧数]          打印函数调用栈（backtrace 同义；默认最多 20 帧）
   list [文件:行号]   显示当前 PC 附近源码；带参数显示指定位置（l 同义）
   var <表达式>       一次性读取全局变量（与 var 子命令相同）
-  watch [组名]       持续显示监视组（w 同义；不带参数列出所有组）；q 返回提示符
+  watch [组名]       GUI 监视窗口显示变量（w 同义；异步：不阻塞命令输入，
+                      与 plot 可同时打开；关窗后可再开；不带参数列出所有组）
   plot [配置名]      GUI 窗口显示曲线（异步：不阻塞命令输入，曲线滚动跟随
-                      内核运行状态；与 watch 互斥；关窗后可再开；不带参数列出所有配置）
+                      内核运行状态；关窗后可再开；不带参数列出所有配置）
   help               显示本帮助
   q                  退出调试会话（quit / exit 同义）
 
@@ -435,7 +532,7 @@ fn debug_run(
     session: &mut Session,
     elf: Option<&std::path::Path>,
     breakpoints: &[Breakpoint],
-    plot: Option<&mut PlotLink>,
+    live: LiveLinks<'_>,
 ) -> Result<()> {
     let mut core = session.core(0)?;
     if !core.core_halted()? {
@@ -454,7 +551,7 @@ fn debug_run(
         "已继续运行，等待断点命中（{} 秒超时）…",
         BP_WAIT_TIMEOUT.as_secs()
     );
-    match wait_halted_with_plot(&mut core, plot) {
+    match wait_halted_with_live(&mut core, live) {
         Ok(true) => {
             let pc: u32 = core
                 .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
@@ -573,16 +670,23 @@ fn debug_bp_clear(
     Ok(())
 }
 
-/// 等待内核暂停（断点命中/主动 halt）。期间若 plot 窗口打开且内核在跑，
-/// 采样照常进行——图像滚动只跟随内核运行状态，与命令是否阻塞无关。
-/// 返回是否在超时内暂停。
-fn wait_halted_with_plot(core: &mut Core, mut plot: Option<&mut PlotLink>) -> Result<bool> {
+/// 等待内核暂停（断点命中/主动 halt）。期间若 plot / watch 窗口打开，
+/// 采样照常进行（plot 跟随内核运行状态、watch 每节拍读值）——
+/// 与命令是否阻塞无关。返回是否在超时内暂停。
+fn wait_halted_with_live(core: &mut Core, live: LiveLinks<'_>) -> Result<bool> {
+    let (mut plot, mut watch) = live;
     let deadline = Instant::now() + BP_WAIT_TIMEOUT;
     loop {
         if let Some(link) = plot.as_deref_mut() {
             if Instant::now() >= link.next_tick {
                 link.next_tick += link.interval;
                 plot_sample(core, link, true); // 等待期间内核在跑
+            }
+        }
+        if let Some(link) = watch.as_deref_mut() {
+            if Instant::now() >= link.next_tick {
+                link.next_tick += link.interval;
+                watch_sample(core, link);
             }
         }
         if core.core_halted()? {
@@ -607,12 +711,12 @@ fn read_pc(core: &mut probe_rs::Core) -> Result<u64> {
 fn run_to_address(
     core: &mut probe_rs::Core,
     addr: u64,
-    plot: Option<&mut PlotLink>,
+    live: LiveLinks<'_>,
 ) -> Result<bool> {
     core.set_hw_breakpoint(addr)
         .with_context(|| format!("设置临时断点 @ 0x{addr:08x} 失败"))?;
     core.run().context("继续运行失败")?;
-    let hit = wait_halted_with_plot(core, plot)?;
+    let hit = wait_halted_with_live(core, live)?;
     if !hit {
         core.halt(HALT_TIMEOUT).context("暂停失败")?;
     }
@@ -626,7 +730,7 @@ fn run_to_address(
 fn run_out_of_function(
     session: &mut Session,
     elf: &std::path::Path,
-    plot: Option<&mut PlotLink>,
+    live: LiveLinks<'_>,
 ) -> Result<()> {
     let mut core = session.core(0)?;
     ensure_halted(&mut core, true)?;
@@ -654,7 +758,7 @@ fn run_out_of_function(
         }
         Some(ra) => {
             let addr = ra & !1;
-            if run_to_address(&mut core, addr, plot)? {
+            if run_to_address(&mut core, addr, live)? {
                 print_pc(read_pc(&mut core)?, Some(elf));
             } else {
                 println!("（未运行到返回地址，已暂停在当前处）");
@@ -714,10 +818,10 @@ fn debug_step(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()
 fn debug_finish(
     session: &mut Session,
     elf: Option<&std::path::Path>,
-    plot: Option<&mut PlotLink>,
+    live: LiveLinks<'_>,
 ) -> Result<()> {
     let e = elf.ok_or_else(|| anyhow!("finish 需要固件镜像（展开信息）"))?;
-    run_out_of_function(session, e, plot)
+    run_out_of_function(session, e, live)
 }
 
 /// 指令级单步：一次执行一条机器指令（不管源码行）
@@ -777,7 +881,7 @@ fn debug_reset(
     elf: &std::path::Path,
     target: &str,
     breakpoints: &[Breakpoint],
-    plot: Option<&mut PlotLink>,
+    live: LiveLinks<'_>,
 ) -> Result<()> {
     let addr = symbol::code_symbol_address(elf, target)?;
     println!("复位并运行到 {target} 开头（0x{addr:08x}）…");
@@ -790,7 +894,7 @@ fn debug_reset(
         .with_context(|| format!("设置断点 @ 0x{addr:08x} 失败"))?;
     core.run().context("继续运行失败")?;
 
-    match wait_halted_with_plot(&mut core, plot) {
+    match wait_halted_with_live(&mut core, live) {
         Ok(true) => {
             let pc: u32 = core
                 .read_core_reg(core.registers().pc().context("找不到 PC 寄存器定义")?.id())
