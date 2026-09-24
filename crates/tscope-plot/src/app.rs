@@ -8,7 +8,9 @@
 //!   多个图组上下叠放、共享 X 轴联动（缩放/平移任一图，全体 X 同步），
 //!   各组 Y 独立自动缩放（量纲不同不互相压扁）；
 //! - 鼠标手势（缩放/平移/框选/双击复位）与键盘（空格暂停、+/− 窗口、r 恢复滚动、s 导出）；
-//! - 暂停期间不接收数据、曲线冻结，恢复时补 NaN 断点（曲线断开不连错线）。
+//! - 暂停期间不接收数据、曲线冻结；暂停时长从时间轴扣除（墙钟跳过 +
+//!   样本整体平移），恢复瞬间丢弃暂停期残留样本并补 NaN 断点——
+//!   曲线**接着暂停处继续**，不空缺口、不回退、不出现负时间。
 //!
 //! # 视图策略（关键设计）
 //!
@@ -118,32 +120,58 @@ pub struct PlotApp {
     /// UI 墙钟起点：滚动窗口跟墙钟走（60fps 连续滑动），
     /// 不跟数据时间走（否则低采样率下窗口按采样周期跳步，看起来卡）
     started: Instant,
-    /// 暂停瞬间的墙钟值（f64）：暂停期间墙钟冻结在此值。
-    /// 注意不能用 Instant + elapsed()——elapsed 在暂停期间照样增长
+    /// 暂停瞬间的**真实流逝**（started.elapsed()，f64）：暂停期间墙钟
+    /// 冻结在 `paused_at − paused_total`。必须存真实流逝而不是墙钟值——
+    /// 恢复时 `d = elapsed − paused_at` 才是本次暂停时长；若存墙钟值，
+    /// 相减会把之前的累计暂停重复计算（第二次暂停起时间轴越走越负）
     paused_at: Option<f64>,
+    /// 累计暂停时长（秒）：墙钟 = 真实流逝 − 累计暂停，
+    /// 暂停时长从时间轴上扣除——恢复后曲线**接着暂停处继续**，
+    /// 而不是空出暂停时长的缺口
+    paused_total: f64,
+    /// 样本时间轴平移量（秒，随每次恢复累积）：
+    /// 数据源（debug 主循环/采样线程）的 t 在暂停期间照走，
+    /// 每次恢复把后续样本整体平移，与扣除暂停的墙钟对齐
+    t_offset: f64,
+    /// 恢复瞬间丢弃下一批样本：数据源在暂停期间照发样本（其时钟不停），
+    /// 这批"暂停期残留"时间在暂停区间内，平移后会落到暂停点之前
+    /// （暂停比已运行时间长时甚至为负）——必须丢掉，不能进曲线
+    drop_next_batch: bool,
     /// 外部暂停通道（debug 会话内嵌 plot 用）：暂停/恢复由外部消息驱动，
     /// 空格键失效——图像滚动与否只跟随内核运行状态
     external_pause: Option<mpsc::Receiver<bool>>,
 }
 
 impl PlotApp {
-    /// 当前墙钟时刻（秒）；暂停时冻结在暂停瞬间的值
+    /// 当前墙钟时刻（秒）= 真实流逝 − 累计暂停时长；暂停时冻结在暂停瞬间
     fn wall_now(&self) -> f64 {
-        self.paused_at
-            .unwrap_or_else(|| self.started.elapsed().as_secs_f64())
+        match self.paused_at {
+            Some(v) => v - self.paused_total,
+            None => self.started.elapsed().as_secs_f64() - self.paused_total,
+        }
     }
 
-    /// 统一的暂停切换：冻结/恢复墙钟 + 恢复时补 NaN 断点
+    /// 统一的暂停切换：冻结/恢复墙钟 + 恢复时补 NaN 断点。
+    /// 暂停时长从时间轴扣除（墙钟跳过 + 样本整体平移），
+    /// 曲线恢复后接着暂停处继续显示。
     fn set_paused(&mut self, p: bool) {
         if p == self.paused {
             return;
         }
         self.paused = p;
         if p {
+            // 记真实流逝：恢复时用它算本次暂停时长（见字段注释）
             self.paused_at = Some(self.started.elapsed().as_secs_f64());
         } else {
-            self.paused_at = None;
+            // 恢复：本次暂停时长 = 真实流逝 − 暂停瞬间的真实流逝
+            // （样本时间轴同样照走了这么久，等量平移回来）
+            let d = self.started.elapsed().as_secs_f64() - self.paused_at.take().unwrap_or(0.0);
+            self.paused_total += d;
+            self.t_offset -= d;
             self.pending_gap = true;
+            // 恢复瞬间数据源里积压的是暂停期间的旧样本（其时间在暂停
+            // 区间内，平移后会落到暂停点之前甚至为负）——下一批整体丢弃
+            self.drop_next_batch = true;
         }
     }
 
@@ -198,6 +226,9 @@ impl PlotApp {
             inner_size: options.inner_size,
             started: Instant::now(),
             paused_at: None,
+            paused_total: 0.0,
+            t_offset: 0.0,
+            drop_next_batch: false,
             external_pause: None,
         })
     }
@@ -207,12 +238,15 @@ impl PlotApp {
         self.external_pause = Some(rx);
     }
 
-    /// 追加一批样本到所有通道的历史（NaN 保持，作为断点）
+    /// 追加一批样本到所有通道的历史（NaN 保持，作为断点）。
+    /// 样本 t 先叠加 t_offset：暂停时长从时间轴扣除后，
+    /// 样本与墙钟重新对齐（恢复后曲线接着暂停处继续）
     fn append(&mut self, batch: &[Sample]) {
         for s in batch {
+            let t = s.t + self.t_offset;
             if self.pending_gap {
                 for h in &mut self.histories {
-                    h.push_back((s.t, f64::NAN));
+                    h.push_back((t, f64::NAN));
                     if h.len() > self.max_history {
                         h.pop_front();
                     }
@@ -220,12 +254,24 @@ impl PlotApp {
                 self.pending_gap = false;
             }
             for (i, h) in self.histories.iter_mut().enumerate() {
-                h.push_back((s.t, s.values.get(i).copied().unwrap_or(f64::NAN)));
+                h.push_back((t, s.values.get(i).copied().unwrap_or(f64::NAN)));
                 if h.len() > self.max_history {
                     h.pop_front();
                 }
             }
         }
+    }
+
+    /// 每帧拉取数据源并（按暂停/恢复规则）决定是否进入曲线：
+    /// - 暂停中：照常排空（防通道积压），不进入曲线；
+    /// - 恢复瞬间：丢弃本批（暂停期间的旧样本，见 [`Self::drop_next_batch`]）；
+    /// - 其余：追加进历史。
+    fn poll_and_append(&mut self) {
+        let batch = self.source.poll();
+        if !self.paused && !self.drop_next_batch {
+            self.append(&batch);
+        }
+        self.drop_next_batch = false;
     }
 
     /// 键盘处理：空格暂停、+/− 窗口、r 恢复滚动、s 导出 CSV
@@ -404,11 +450,8 @@ impl eframe::App for PlotApp {
         for p in msgs {
             self.set_paused(p);
         }
-        // 拉取数据：暂停时照常排空数据源（防通道积压），但不进入曲线
-        let batch = self.source.poll();
-        if !self.paused {
-            self.append(&batch);
-        }
+        // 拉取数据：暂停时排空、恢复瞬间丢弃残留、其余进曲线
+        self.poll_and_append();
         self.handle_keys(ctx);
         self.update_title(ctx);
         // 曲线 60fps 连续重绘
@@ -727,5 +770,113 @@ mod window_tests {
             (frozen - 2.0).abs() < 1e-9,
             "暂停后墙钟仍在走：frozen={frozen}"
         );
+    }
+
+    /// 暂停期间数据源的时间照走：恢复时必须把暂停时长从时间轴扣除，
+    /// 曲线才会"接着暂停处继续"而不是空出暂停时长的缺口
+    #[test]
+    fn pause_resume_excludes_pause_from_time_axis() {
+        let (_tx, rx) = mpsc::channel::<Sample>();
+        let source = ChannelSource::new(rx, vec!["x".to_string()]);
+        let mut app = PlotApp::new(
+            Box::new(source),
+            PlotOptions {
+                window_secs: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // 运行期样本：生产者时钟 = 真实流逝（与墙钟同源）
+        let t1 = app.started.elapsed().as_secs_f64();
+        app.append(&[Sample {
+            t: t1,
+            values: vec![1.0],
+        }]);
+        // 暂停 50ms（期间生产者时钟照走，但不发样本）
+        let w1 = app.wall_now();
+        app.set_paused(true);
+        std::thread::sleep(Duration::from_millis(50));
+        app.set_paused(false);
+        // 墙钟连续：恢复后接着暂停处，不跳 50ms
+        let w2 = app.wall_now();
+        assert!(
+            (w2 - w1).abs() < 0.01,
+            "恢复后墙钟应接着暂停处：w1={w1} w2={w2}"
+        );
+        // 恢复后的样本：t 含 50ms 暂停（生产者时钟照走），应被平移回来
+        let t2 = app.started.elapsed().as_secs_f64();
+        app.append(&[Sample {
+            t: t2,
+            values: vec![2.0],
+        }]);
+        let h = &app.histories[0];
+        assert_eq!(h.len(), 3, "样本1 + NaN 断点 + 样本2：{h:?}");
+        assert_eq!(h[0].1, 1.0);
+        assert!(h[1].1.is_nan(), "恢复处应有 NaN 断点");
+        assert_eq!(h[2].1, 2.0);
+        let dt = h[2].0 - h[0].0;
+        assert!(
+            dt.abs() < 0.02,
+            "暂停时长应从时间轴扣除（50ms 暂停不应出现在 X 轴）：dt={dt}"
+        );
+        // 样本时间与墙钟对齐：样本2 应落在当前墙钟附近
+        assert!(
+            (h[2].0 - app.wall_now()).abs() < 0.02,
+            "样本时间应与扣除暂停的墙钟对齐"
+        );
+    }
+
+    /// 用户场景回归：连按多次暂停（独立模式采样线程在暂停期间照发样本）。
+    /// 恢复瞬间必须丢弃暂停期残留——否则残留样本被平移回暂停点之前，
+    /// 暂停比已运行时间长时出现负时间、曲线回退重画
+    #[test]
+    fn rapid_pause_resume_never_goes_negative() {
+        let (tx, rx) = mpsc::channel::<Sample>();
+        let source = ChannelSource::new(rx, vec!["x".to_string()]);
+        let mut app = PlotApp::new(
+            Box::new(source),
+            PlotOptions {
+                window_secs: 5.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // 运行期样本（真实时钟 = started.elapsed，含全部暂停时长）
+        app.append(&[Sample {
+            t: app.started.elapsed().as_secs_f64(),
+            values: vec![1.0],
+        }]);
+        for i in 0..5 {
+            // 暂停 40ms：期间采样线程照发样本（残留，数值用大数标记）
+            app.set_paused(true);
+            std::thread::sleep(Duration::from_millis(40));
+            tx.send(Sample {
+                t: app.started.elapsed().as_secs_f64(),
+                values: vec![100.0 + i as f64],
+            })
+            .unwrap();
+            app.set_paused(false);
+            // 恢复瞬间那一帧：残留样本必须被丢弃（真实逻辑路径）
+            app.poll_and_append();
+            // 恢复后的正常样本
+            app.append(&[Sample {
+                t: app.started.elapsed().as_secs_f64(),
+                values: vec![2.0 + i as f64],
+            }]);
+        }
+        let h = &app.histories[0];
+        assert!(h.len() >= 2, "至少应有样本+断点：{h:?}");
+        let mut last_t = -1.0f64;
+        for &(t, v) in h.iter() {
+            assert!(t >= 0.0, "出现负时间：t={t}（{h:?}）");
+            assert!(t >= last_t, "时间回退：t={t}，前一个={last_t}（{h:?}）");
+            if !v.is_nan() {
+                assert!(
+                    v < 50.0,
+                    "暂停期残留样本混入曲线（值 {v} 是暂停期间发的）：{h:?}"
+                );
+            }
+            last_t = t;
+        }
     }
 }
