@@ -1,5 +1,5 @@
 //! 变量监视窗口（Keil Watch 风格）：两列表格（变量名 + 格式化值），
-//! 值变化时整行黄色高亮、约 0.3 秒渐退。
+//! 值变化时**值列**淡黄色高亮（约 35% 透明度，数字清晰可读）、约 0.3 秒渐退。
 //!
 //! 数据驱动：外部每节拍调用 [`WatchApp::set_values`] 送入各变量的
 //! 格式化文本（真实场景由 debug 主循环采样、格式化后经子进程 stdin
@@ -194,34 +194,34 @@ impl eframe::App for WatchApp {
             max + 16.0
         });
 
-        // 表格主体：每行 名称 | 值（值可多行）
+        // 表格主体：每行 名称 | 值（值可多行）。
+        // 变化高亮只打在"值"那一格上（名字没变不该闪），淡黄底 ≈35%
+        // 透明度——闪一下提醒变化，数字始终清晰可读
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for i in 0..self.entries.len() {
                     let alpha = self.highlight_left[i] / HIGHLIGHT_SECS;
                     let fill = if alpha > 0.0 {
-                        Color32::from_rgba_unmultiplied(255, 225, 70, (alpha * 200.0) as u8)
+                        Color32::from_rgba_unmultiplied(255, 225, 70, (alpha * 90.0) as u8)
                     } else {
                         Color32::TRANSPARENT
                     };
-                    egui::Frame::new()
-                        .inner_margin(Margin::symmetric(6, 3))
-                        .fill(fill)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [name_width, 16.0],
-                                    Label::new(
-                                        RichText::new(&self.entries[i].name)
-                                            .monospace()
-                                            .strong(),
-                                    ),
-                                );
-                                ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [name_width, 16.0],
+                            Label::new(
+                                RichText::new(&self.entries[i].name).monospace().strong(),
+                            ),
+                        );
+                        ui.separator();
+                        egui::Frame::new()
+                            .inner_margin(Margin::symmetric(2, 0))
+                            .fill(fill)
+                            .show(ui, |ui| {
                                 ui.label(RichText::new(&self.entries[i].value).monospace());
                             });
-                        });
+                    });
                 }
             });
     }
