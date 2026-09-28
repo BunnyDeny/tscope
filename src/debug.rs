@@ -261,7 +261,11 @@ pub fn run(config: &ToolConfig) -> Result<()> {
                         let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
                         debug_run(&mut session, elf.as_deref(), &breakpoints, live)
                     }
-                    "step" | "s" | "next" | "n" => debug_step(&mut session, elf.as_deref()),
+                    "step" | "s" => debug_step(&mut session, elf.as_deref()),
+                    "next" | "n" => {
+                        let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
+                        debug_next(&mut session, elf.as_deref(), &breakpoints, live)
+                    }
                     "stepi" | "si" => debug_stepi(&mut session, elf.as_deref()),
                     "finish" | "fin" | "f" => {
                         let live = (plot_ctx.as_mut(), watch_ctx.as_mut());
@@ -477,8 +481,10 @@ fn print_help() {
   bc <编号|all>      删除断点，如 bc 1 / bc all
   run                全速运行（continue / c 同义）；有断点时命中停下并报现场
   halt               暂停内核
-  step               单步一行源码（s/next/n 同义）；函数末尾自动走出，
-                     中断函数末尾自动越过异常返回（回到被打断的代码）
+  step               单步进入一行源码（s 同义）；遇函数调用会进入被调函数；
+                     函数末尾自动走出，中断函数末尾自动越过异常返回
+  next               单步跳过一行源码（n 同义）；函数调用不进入，直接执行完
+                     跳到当前函数的下一语句（被调函数内断点仍会命中）
   stepi              单步一条机器指令（si 同义；-O2 下行号会跳）
   finish             运行到当前函数返回（f / fin 同义；中断函数回到被打断处）
   reset [函数名]     复位并暂停在函数开头，默认 main（rst 同义）
@@ -810,6 +816,107 @@ fn debug_step(session: &mut Session, elf: Option<&std::path::Path>) -> Result<()
         }
     }
     println!("（单步 200 条指令仍未走到下一行，可能在长循环中）");
+    print_pc(read_pc(&mut core)?, elf);
+    Ok(())
+}
+
+/// next：单步跳过一行源码（gdb 同款算法）——**不进入函数调用**。
+///
+/// 从当前行出发逐指令单步：
+/// - 回到原函数且行号变了 → 完成；
+/// - 回到原函数且行号没变 → 继续（同一行内还有语句/循环体）；
+/// - 进了别的函数（函数调用/中断）→ 跳过它：
+///   - **快路径**：LR 是合法返回地址（非异常返回值）且硬件断点有富余时，
+///     在返回地址设临时断点全速跑过去——一次调用只花两次断点往返，
+///     不用一条条单步穿过整个被调函数（memcpy 那种要几百上千步）；
+///   - **兜底**：LR 为异常返回值（中断上下文）或断点已用满时，
+///     退化为纯单步穿过被调函数（每步都检查是否回到原函数）。
+///
+/// 被调函数 10 秒没返回则暂停并如实报告，不挂死。
+fn debug_next(
+    session: &mut Session,
+    elf: Option<&std::path::Path>,
+    breakpoints: &[Breakpoint],
+    mut live: LiveLinks<'_>,
+) -> Result<()> {
+    let mut core = session.core(0)?;
+    ensure_halted(&mut core, true)?;
+    let start_pc = read_pc(&mut core)?;
+
+    // 无行号信息（汇编/库代码）：直接指令单步
+    let Some((start_file, start_line)) = elf.and_then(|e| symbol::address_to_line(e, start_pc))
+    else {
+        let info = core.step().context("单步失败")?;
+        print_pc(info.pc, elf);
+        return Ok(());
+    };
+    let start_func = elf.and_then(|e| symbol::function_name_at(e, start_pc));
+
+    // 硬件断点余量：有富余才能用 LR 断点快路径（用户断点优先）
+    let units = core.available_breakpoint_units()? as usize;
+    let can_bp = breakpoints.len() < units;
+
+    // LR 寄存器：快路径要读返回地址（R14 架构名，按名字链查找）
+    let lr_id = core
+        .registers()
+        .core_registers()
+        .find(|r| r.name() == "LR" || r.name() == "R14")
+        .map(|r| r.id());
+
+    for _ in 0..1000 {
+        core.step().context("单步失败")?;
+        let p = read_pc(&mut core)?;
+
+        if elf.and_then(|e| symbol::function_name_at(e, p)) != start_func {
+            // —— 进了别的函数（函数调用/中断）：跳过它 ——
+            if can_bp {
+                if let Some(lr_id) = lr_id {
+                    let lr: u32 = core.read_core_reg(lr_id).unwrap_or(0);
+                    let ra = (lr & !1) as u64;
+                    if ra != 0 && !backtrace::is_exc_return(ra) {
+                        // 快路径：临时断点 @ 返回地址，全速跑过去
+                        core.set_hw_breakpoint(ra)
+                            .with_context(|| format!("设置临时断点 @ 0x{ra:08x} 失败"))?;
+                        core.run().context("继续运行失败")?;
+                        // 重新借用 live（本行可能多次进入调用，不能 move 走）
+                        let hit =
+                            wait_halted_with_live(&mut core, (live.0.as_deref_mut(), live.1.as_deref_mut()))?;
+                        core.clear_hw_breakpoint(ra)
+                            .with_context(|| format!("清除临时断点 @ 0x{ra:08x} 失败"))?;
+                        if !hit {
+                            // 被调函数没回来：停下并如实报告
+                            core.halt(HALT_TIMEOUT).context("暂停失败")?;
+                            println!(
+                                "（next 超时：{} 秒内未从被调函数返回，已暂停）",
+                                BP_WAIT_TIMEOUT.as_secs()
+                            );
+                            print_pc(read_pc(&mut core)?, elf);
+                            return Ok(());
+                        }
+                        // 已回到返回地址：本行可能还有后续语句，继续单步
+                        let p2 = read_pc(&mut core)?;
+                        if let Some((f, l)) = elf.and_then(|e| symbol::address_to_line(e, p2)) {
+                            if f != start_file || l != start_line {
+                                print_pc(p2, elf);
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            // 兜底：纯单步穿过被调函数，下一条指令再判断
+            continue;
+        }
+        // 还在原函数：行号变了即完成
+        if let Some((f, l)) = elf.and_then(|e| symbol::address_to_line(e, p)) {
+            if f != start_file || l != start_line {
+                print_pc(p, elf);
+                return Ok(());
+            }
+        }
+    }
+    println!("（单步 1000 条指令仍未走到下一行，可能陷入同一行的长循环）");
     print_pc(read_pc(&mut core)?, elf);
     Ok(())
 }
